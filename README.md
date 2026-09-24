@@ -7,7 +7,7 @@
 <a href="./LICENSE.txt"><img src="https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey" alt="License"></a>
 </div>
 
-This repository accompanies the bachelor's thesis *Geometrically-Grounded Uncertainty Quantification for Foundational 3D Vision Models* (Leonardo Vanni, Bocconi University, 2026). VGGT's `CameraHead` is kept frozen and extended with a parallel *covariance branch* that outputs the Cholesky factor of a Gaussian over the pose error on the Lie algebra se(3). The frozen VGGT-1B backbone and mean-pose pathway are bit-identical to the upstream release, so point estimates are unchanged; only the uncertainty head is trained.
+This repository accompanies the bachelor's thesis [*Geometrically-Grounded Uncertainty Quantification for Foundational 3D Vision Models*](https://github.com/VanniLeonardo/Bachelor-Thesis/releases/download/v1.0.0/bachelor_thesis.pdf) (Leonardo Vanni, Bocconi University, 2026). VGGT's `CameraHead` is kept frozen and extended with a parallel *covariance branch* that outputs the Cholesky factor of a Gaussian over the pose error on the Lie algebra se(3). The frozen VGGT-1B backbone and mean-pose pathway are bit-identical to the upstream release, so point estimates are unchanged; only the uncertainty head is trained.
 
 > **Note on the thesis version.** The code released here fixes several bugs found while preparing it for publication and is a slightly modified version of the code used for the thesis experiments. The revised thesis (v2) reports numbers recomputed with this code.
 
