@@ -43,7 +43,14 @@ Python ≥ 3.10; tested with torch 2.3.1 / CUDA 12.1 on a single 24 GB GPU. Set 
 | `facebook/VGGT-1B` `model.pt` | upstream VGGT-1B (downloaded automatically) | 5.0 GB |
 | `vggt_uncertainty_head_v1.pt` | covariance branch + metadata (κ, shield, error convention, fitted temperature) | ≈0.4 GB (fp16) |
 
-The head file will be published on the Hugging Face Hub with the v1.0.0 release; until then train it with the instructions below. Everything else is loaded from the upstream weights.
+The head is attached to the [v1.0.0 release](https://github.com/VanniLeonardo/Bachelor-Thesis/releases/tag/v1.0.0):
+
+```bash
+wget https://github.com/VanniLeonardo/Bachelor-Thesis/releases/download/v1.0.0/vggt_uncertainty_head_v1.pt
+sha256sum vggt_uncertainty_head_v1.pt   # b5b73307d9e38c14e53cafc7735cd822a75aad35e0976eae0d24974fdb724194
+```
+
+It is the epoch-19 checkpoint of the run described in the thesis, with the temperature T = 1.015 fitted on the calibration half of the CO3D test split. Everything else is loaded from the upstream weights.
 
 ## Quick start
 
