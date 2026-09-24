@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import io
 import os
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 import cv2
@@ -684,6 +685,41 @@ def read_depth(path: str, scale_adjustment=1.0) -> np.ndarray:
     d[~np.isfinite(d)] = 0.0
 
     return d
+
+
+def decode_image_cv2(data: bytes, rgb: bool = True) -> np.ndarray:
+    """Decode an encoded image held in memory, matching :func:`read_image_cv2`."""
+    img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    if rgb:
+        if len(img.shape) == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return img
+
+
+def decode_16big_png_depth(data: bytes) -> np.ndarray:
+    """In-memory twin of :func:`load_16big_png_depth` (16-bit PNG holding float16 bits)."""
+    with Image.open(io.BytesIO(data)) as depth_pil:
+        return (
+            np.frombuffer(np.array(depth_pil, dtype=np.uint16), dtype=np.float16)
+            .astype(np.float32)
+            .reshape((depth_pil.size[1], depth_pil.size[0]))
+        )
+
+
+def decode_depth(data: bytes, scale_adjustment: float = 1.0) -> np.ndarray:
+    """In-memory twin of :func:`read_depth` for the 16-bit PNG depths used by CO3D."""
+    d = decode_16big_png_depth(data) * scale_adjustment
+    d[~np.isfinite(d)] = 0.0
+    return d
+
+
+def decode_mask_gray(data: bytes) -> np.ndarray:
+    """Decode a grayscale mask, matching ``cv2.imread(path, cv2.IMREAD_GRAYSCALE)``."""
+    return cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
 
 
 def load_16big_png_depth(depth_png: str) -> np.ndarray:

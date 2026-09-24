@@ -5,23 +5,26 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
-from hydra import initialize, compose
-from omegaconf import DictConfig, OmegaConf
+
+from hydra import compose, initialize
 from trainer import Trainer
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train model with configurable YAML file")
-    parser.add_argument(
-        "--config", 
-        type=str, 
-        default="default",
-        help="Name of the config file (without .yaml extension, default: default)"
+    parser = argparse.ArgumentParser(
+        description="Train or evaluate the model with a Hydra config; extra arguments are Hydra overrides "
+        "(e.g. `mode=val checkpoint.resume_checkpoint_path=/path/to/ckpt.pt limit_val_batches=1000`)."
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="default",
+        help="Name of the config file in training/config (without .yaml extension, default: default)",
+    )
+    args, overrides = parser.parse_known_args()
 
     with initialize(version_base=None, config_path="config"):
-        cfg = compose(config_name=args.config)
+        cfg = compose(config_name=args.config, overrides=overrides)
 
     trainer = Trainer(**cfg)
     trainer.run()
@@ -29,5 +32,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

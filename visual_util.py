@@ -14,6 +14,90 @@ import cv2
 import os
 import requests
 
+from vggt.utils.uncertainty import camera_centers, pose_covariances_from_predictions
+
+
+def pose_covariances_world(cholesky_vectors, extrinsics, kappa=10.0, temperature=1.0):
+    """(S, 21) network output + (S, 3, 4) camera-from-world -> (S, 6, 6) covariances in world coordinates.
+
+    Thin wrapper around :func:`vggt.utils.uncertainty.pose_covariances_from_predictions`
+    (physical units: normalized scene units and radians; kappa weighting undone).
+    """
+    return pose_covariances_from_predictions(cholesky_vectors, extrinsics, kappa=kappa, temperature=temperature, frame="world")
+
+
+def create_uncertainty_ellipsoid(center, covariance, confidence_level=0.95, resolution=20, color=(255, 0, 0, 100)):
+    """
+    Create a 3D uncertainty ellipsoid mesh from a covariance matrix.
+    
+    Args:
+        center: (3,) array of ellipsoid center
+        covariance: (3, 3) covariance matrix for translation uncertainty
+        confidence_level: confidence level for the ellipsoid (default: 0.95)
+        resolution: mesh resolution (default: 20)
+        color: RGBA color tuple (default: semi-transparent red)
+    
+    Returns:
+        trimesh.Trimesh: Ellipsoid mesh
+    """
+    # Chi-squared value for given confidence level in 3D
+    from scipy.stats import chi2
+    chi2_val = chi2.ppf(confidence_level, df=3)
+    
+    # Eigendecomposition of covariance matrix
+    eigenvals, eigenvecs = np.linalg.eigh(covariance)
+    
+    # Ensure positive eigenvalues for numerical stability
+    eigenvals = np.maximum(eigenvals, 1e-8)
+    
+    # Create unit sphere
+    sphere = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
+    
+    # Scale by sqrt(eigenvalues * chi2_val) to get proper ellipsoid
+    scales = np.sqrt(eigenvals * chi2_val)
+    
+    # Transform sphere to ellipsoid
+    # First scale by eigenvalues
+    scale_matrix = np.diag(scales)
+    
+    # Then rotate by eigenvectors
+    rotation_matrix = eigenvecs
+    
+    # Apply transformations
+    vertices = sphere.vertices @ scale_matrix @ rotation_matrix.T
+    
+    # Translate to center
+    vertices += center
+    
+    # Update mesh
+    ellipsoid = trimesh.Trimesh(vertices=vertices, faces=sphere.faces)
+    
+    # Set color (semi-transparent)
+    ellipsoid.visual.face_colors = np.array(color, dtype=np.uint8)
+    
+    return ellipsoid
+
+
+def compute_scene_bounds(point_cloud):
+    """Compute scene bounds from point cloud for adaptive uncertainty scaling."""
+    if hasattr(point_cloud, 'cpu'):
+        pc_np = point_cloud.cpu().detach().numpy()
+    else:
+        pc_np = np.array(point_cloud)
+    
+    if pc_np.shape[0] == 0:
+        return {'size': 1.0, 'center': np.array([0, 0, 0]), 'bounds': (np.array([-1, -1, -1]), np.array([1, 1, 1]))}
+    
+    min_bounds = np.min(pc_np, axis=0)
+    max_bounds = np.max(pc_np, axis=0)
+    scene_size = np.max(max_bounds - min_bounds)
+    
+    return {
+        'size': scene_size,
+        'center': (min_bounds + max_bounds) / 2,
+        'bounds': (min_bounds, max_bounds)
+    }
+
 
 def predictions_to_glb(
     predictions,
@@ -25,6 +109,11 @@ def predictions_to_glb(
     mask_sky=False,
     target_dir=None,
     prediction_mode="Predicted Pointmap",
+    show_uncertainty_ellipses=False,
+    kappa=10.0,
+    temperature=1.0,
+    uncertainty_sigma_multiplier=1.0,
+    uncertainty_confidence=0.95,
 ) -> trimesh.Scene:
     """
     Converts VGGT predictions to a 3D scene represented as a GLB file.
@@ -35,6 +124,7 @@ def predictions_to_glb(
             - world_points_conf: Confidence scores (S, H, W)
             - images: Input images (S, H, W, 3)
             - extrinsic: Camera extrinsic matrices (S, 3, 4)
+            - cholesky_vector: Uncertainty vectors (S, 21) [optional]
         conf_thres (float): Percentage of low-confidence points to filter out (default: 50.0)
         filter_by_frames (str): Frame filter specification (default: "all")
         mask_black_bg (bool): Mask out black background pixels (default: False)
@@ -43,6 +133,10 @@ def predictions_to_glb(
         mask_sky (bool): Apply sky segmentation mask (default: False)
         target_dir (str): Output directory for intermediate files (default: None)
         prediction_mode (str): Prediction mode selector (default: "Predicted Pointmap")
+        show_uncertainty_ellipses (bool): Include the camera-centre uncertainty ellipsoids (default: False)
+        kappa, temperature: training rotation weight and calibration temperature of the uncertainty head
+        uncertainty_sigma_multiplier (float): display-only rescaling of the ellipsoids (1.0 = true size)
+        uncertainty_confidence (float): confidence level of the ellipsoids (default 0.95)
 
     Returns:
         trimesh.Scene: Processed 3D scene containing point cloud and cameras
@@ -206,13 +300,35 @@ def predictions_to_glb(
             rgba_color = colormap(i / num_cameras)
             current_color = tuple(int(255 * x) for x in rgba_color[:3])
 
-            integrate_camera_into_scene(scene_3d, camera_to_world, current_color, scene_scale)
+            integrate_camera_into_scene(scene_3d, camera_to_world, current_color, float(scene_scale))
 
-    # Align scene to the observation of the first camera
-    scene_3d = apply_scene_alignment(scene_3d, extrinsics_matrices)
+    # Camera-centre uncertainty ellipsoids (world frame, true scale) - added BEFORE the scene
+    # alignment so that they are transformed together with the cameras.
+    if show_uncertainty_ellipses and predictions.get("cholesky_vector") is not None:
+        cholesky_vectors = predictions["cholesky_vector"]
+        if selected_frame_idx is not None:
+            cholesky_vectors = cholesky_vectors[selected_frame_idx : selected_frame_idx + 1]
+        Sigma_world = pose_covariances_world(cholesky_vectors, camera_matrices, kappa=kappa, temperature=temperature)
+        centers = camera_centers(camera_matrices)
+        for i in range(min(num_cameras, len(cholesky_vectors))):
+            try:
+                ellipsoid = create_uncertainty_ellipsoid(
+                    center=centers[i],
+                    covariance=Sigma_world[i, :3, :3] * uncertainty_sigma_multiplier**2,
+                    confidence_level=uncertainty_confidence,
+                    resolution=20,
+                    color=(255, 100, 100, 80),
+                )
+                scene_3d.add_geometry(ellipsoid, node_name=f"uncertainty_ellipsoid_{i}")
+            except Exception as e:
+                print(f"Warning: Could not create uncertainty ellipsoid for camera {i}: {e}")
+        print(f"Added {min(num_cameras, len(cholesky_vectors))} uncertainty ellipsoids to scene")
+
+    # Apply scene alignment transformation to the entire scene (cameras AND ellipsoids together)
+    aligned_scene = apply_scene_alignment(scene_3d, extrinsics_matrices)
 
     print("GLB Scene built")
-    return scene_3d
+    return aligned_scene
 
 
 def integrate_camera_into_scene(scene: trimesh.Scene, transform: np.ndarray, face_colors: tuple, scene_scale: float):

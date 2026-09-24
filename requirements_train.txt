@@ -1,0 +1,11 @@
+# Training / evaluation of the pose-uncertainty head (on top of requirements.txt)
+hydra-core>=1.3
+omegaconf>=2.3
+fvcore
+iopath
+tensorboard
+opencv-python
+wcmatch
+scipy
+matplotlib
+pytest

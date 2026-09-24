@@ -147,3 +147,23 @@ skyseg.onnx
 # pixi environments
 .pixi
 *.egg-info
+
+.gradio
+car_ann
+co3d
+# scratch test files at the repo root (the tests/ suite is tracked)
+/test.py
+/test_*.py
+/test_*/
+.pytest_cache/
+logs
+model.pt
+uv.lock
+# local experiment data (never shipped)
+/input_images_*/
+/for_colmap/
+/*.png
+/logs/
+/examples/videos/*/
+/examples/videos/script.sh
+/examples/my_images*

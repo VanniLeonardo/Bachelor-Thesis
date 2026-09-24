@@ -55,7 +55,7 @@ class DynamicTorchDataset(ABC):
             raise ValueError(f"image_num_range must be [min, max] with 1 <= min <= max, got {self.image_num_range}")
 
         # Create samplers
-        self.sampler = DynamicDistributedSampler(self.dataset, seed=seed, shuffle=shuffle)
+        self.sampler = DynamicDistributedSampler(self.dataset, seed=seed, shuffle=shuffle, drop_last=True)
         self.batch_sampler = DynamicBatchSampler(
             self.sampler,
             self.aspect_ratio_range,

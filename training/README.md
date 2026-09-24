@@ -1,132 +1,91 @@
-# Training
+# Training the pose-uncertainty head
 
-This is a re-implementation of our framework for training VGGT. This document shows how to set up the environment and run VGGT training. I have aimed to faithfully reproduce the original training framework, but please open an issue if anything looks off.
+This folder is the upstream VGGT training framework (Hydra config, DDP trainer, CO3D
+loader) reduced to one job: fine-tune the `camera_head.covariance_branch` of a frozen
+VGGT-1B so that it predicts a calibrated 6×6 covariance of the camera pose.
 
-## 1. Prerequisites
+## 1. Data
 
-Before you begin, ensure you have completed the following steps:
-
-1. **Install VGGT as a package:**
+1. Download CO3D v2 (or a subset of categories) with the official script:
    ```bash
-   pip install -e .
+   git clone https://github.com/facebookresearch/co3d && cd co3d
+   python co3d/download_dataset.py --download_folder /data/CO3D \
+       --download_categories tv,parkingmeter,baseballbat,microwave,baseballglove,pizza,toybus,bowl,donut,toytrain,toyplane,cake,broccoli,banana,toaster,cup,bicycle,car \
+       --n_download_workers 2 --n_extract_workers 2 --clear_archives_after_unpacking
+   ```
+   The 18 categories above (≈830 GB, 4 650 training and 595 test sequences, all in VGGT's
+   training list) are the ones used for the released head; any subset works.
+2. Download the VGGT annotation files (all 51 categories, 0.6 GB):
+   ```bash
+   python -c "from huggingface_hub import snapshot_download; snapshot_download('JianyuanWang/co3d_anno', repo_type='dataset', local_dir='/data/CO3D_ann')"
+   ```
+   Sequences whose images or depth maps are missing on disk are skipped automatically and
+   the counts are written to the log.
+3. Point the config at your paths (environment variables override the defaults in `config/default.yaml`):
+   ```bash
+   export CO3D_DIR=/data/CO3D CO3D_ANNOTATION_DIR=/data/CO3D_ann VGGT_PRETRAINED_CKPT=/path/to/model.pt
    ```
 
-2. **Prepare the dataset and annotations:**
-   - Download the Co3D dataset from the [official repository](https://github.com/facebookresearch/co3d).
-   - Download the required annotation files from [Hugging Face](https://huggingface.co/datasets/JianyuanWang/co3d_anno/tree/main).
-
-## 2. Configuration
-
-After downloading the dataset and annotations, configure the paths in `training/config/default.yaml`.
-
-### Required Path Configuration
-
-1. Open `training/config/default.yaml`
-2. Update the following paths with your absolute directory paths:
-   - `CO3D_DIR`: Path to your Co3D dataset
-   - `CO3D_ANNOTATION_DIR`: Path to your Co3D annotation files
-   - `resume_checkpoint_path`: Path to your pre-trained VGGT checkpoint
-
-### Configuration Example
-
-```yaml
-data:
-  train:
-    dataset:
-      dataset_configs:
-        - _target_: data.datasets.co3d.Co3dDataset
-          split: train
-          CO3D_DIR: /YOUR/PATH/TO/CO3D
-          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
-# ... same for val ...
-
-checkpoint:
-  resume_checkpoint_path: /YOUR/PATH/TO/CKPT
-```
-
-## 3. Fine-tuning on Co3D
-
-To fine-tune the provided pre-trained model on the Co3D dataset, run the following command. This example uses 4 GPUs with PyTorch Distributed Data Parallel (DDP):
+## 2. Train
 
 ```bash
-torchrun --nproc_per_node=4 launch.py
+cd training
+torchrun --nproc_per_node=1 launch.py --config default            # single GPU
+torchrun --nproc_per_node=4 launch.py --config default            # DDP
+torchrun --nproc_per_node=1 launch.py --config default max_epochs=10 exp_name=my_run   # Hydra overrides
 ```
 
-The default configuration in `training/config/default.yaml` is set up for fine-tuning. It automatically resumes from a checkpoint and freezes the model's `aggregator` module during training.
+Stopping and resuming: a run can be killed at any time and restarted with the same command.
+It resumes from `logs/<exp_name>/ckpts/checkpoint.pt` (written after every epoch) with the epoch,
+optimizer state and data order restored, so the result is identical to an uninterrupted run.
+The progress of a partly finished epoch is lost. Use a new `exp_name` to start a fresh run.
 
-## 4. Training on Multiple Datasets
+What the default config does (`config/default.yaml`):
 
-The dataloader supports multiple datasets naturally. For example, if you have downloaded VKitti using `preprocess/vkitti.sh`, you can train on Co3D+VKitti by configuring:
+- Freezes everything except `camera_head.covariance_branch`; the frozen modules run in eval mode, so VGGT's poses are exactly the upstream ones.
+- Normalizes each batch to VGGT's frame (camera 0 = identity, mean point distance 1). All losses are computed in these units; camera 0 is excluded (it carries no error).
+- Loss = Gaussian NLL of the body-centric error twist `log(E_pred E_gt⁻¹)` in κ-weighted coordinates (κ = 10) with a shielded covariance `Σ = LLᵀ + εI`, plus the scale, condition-number and isotropy regularizers of the thesis (Algorithms 1–4).
+- Curriculum: `warmup_epochs` with the NLL disabled (regularizers only), then NLL with the regularizer weights annealed linearly to zero at `max_epochs`.
+- Dynamic batching: 2–24 frames per sample, `floor(24 / n_frames)` samples per step, a frame-reversed copy appended, 2 accumulation steps; AdamW 5e-5, 5% linear warm-up then cosine decay.
+- Logs the resolved configuration, the checkpoint path and the trainable tensors to `logs/<exp_name>/log.txt`; TensorBoard scalars include the mean Mahalanobis distance (≈6 when calibrated), the mean log-det, and the mean translational / rotational σ.
 
-```yaml
-data:
-  train:
-    dataset:
-      _target_: data.composed_dataset.ComposedDataset
-      dataset_configs:
-        - _target_: data.datasets.co3d.Co3dDataset
-          split: train
-          CO3D_DIR: /YOUR/PATH/TO/CO3D
-          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
-          len_train: 100000
-        - _target_: data.datasets.vkitti.VKittiDataset
-          split: train
-          VKitti_DIR: /YOUR/PATH/TO/VKitti
-          len_train: 100000
-          expand_ratio: 8 
+Memory: `max_img_per_gpu`, `accum_steps` and `img_size` control the footprint; the defaults fit a 24 GB GPU.
+
+## 3. Evaluate and calibrate
+
+The CO3D test sequences are split once into two disjoint halves, balanced per category
+(`splits/co3d_test_calib.txt`, 294 sequences, and `splits/co3d_test_eval.txt`, 301; see
+`../scripts/split_co3d_test.py`). The temperature is fitted on the first and every
+reported number comes from the second.
+
+```bash
+# 1000 validation batches on each half; each run writes logs/<exp>/calibration_epoch_0.npz
+# with the per-frame d^2, log-det and translation / rotation error
+torchrun --nproc_per_node=1 launch.py --config eval_calib checkpoint.resume_checkpoint_path=logs/v1.0.0/ckpts/checkpoint.pt
+torchrun --nproc_per_node=1 launch.py --config eval_eval  checkpoint.resume_checkpoint_path=logs/v1.0.0/ckpts/checkpoint.pt
+
+# fit T on the calibration half, report T = 1 and the fitted T on the evaluation half
+python ../plot_calibration.py --calib logs/eval_calib/calibration_epoch_0.npz \
+    --test logs/eval_eval/calibration_epoch_0.npz --out calibration.png
 ```
 
-The ratio of different datasets can be controlled by setting `len_train`. For example, Co3D with `len_train: 10000` and VKitti with `len_train: 2000` will result in Co3D being sampled five times more frequently than VKitti.
+The temperature is fitted by matching the median of `d^2` to that of `chi^2_6`. The
+Gaussian maximum-likelihood fit `T = mean(d^2) / 6` is dominated by the few frames where
+VGGT fails by tens of degrees, so it is reported only for reference. Because the
+temperature multiplies the shielded covariance, the NLL at any `T` follows exactly from
+the saved `d^2` and log-det, and a second evaluation run is not needed.
 
-## 5. Common Questions
+## 4. Export the head for release
 
-### Memory Management
-
-If you encounter out-of-memory (OOM) errors on your GPU, consider adjusting the following parameters in `training/config/default.yaml`:
-
-- `max_img_per_gpu`: Reduce this value to decrease the batch size per GPU
-- `accum_steps`: Sets the number of gradient accumulation steps (default is 2). This feature splits batches into smaller chunks to save memory, though it may slightly increase training time. Note that gradient accumulation was not used for the original VGGT model.
-
-### Learning Rate Tuning
-
-The main hyperparameter to be careful about is learning rate. Note that learning rate depends on the effective batch size, which is `batch_size_per_gpu × num_gpus`. Therefore, I highly recommend trying several learning rates based on your training setup. Generally, trying values like `5e-6`, `1e-5`, `5e-5`, `1e-4`, `5e-4` should be sufficient.
-
-### Tracking Head
-
-The tracking head can slightly improve accuracy but is not necessary. For general cases, especially when GPU resources are limited, we suggest fine-tuning the pre-trained model only with camera and depth heads, which is the setting in `default.yaml`. This will provide good enough results.
-
-### Dataloader Validation
-
-To check if your dataloader is working correctly, the best approach is to visualize its output. You can save the 3D world points as follows and then visually inspect the PLY files:
-
-```python
-def save_ply(points, colors, filename):
-    import open3d as o3d                
-    if torch.is_tensor(points):
-        points_visual = points.reshape(-1, 3).cpu().numpy()
-    else:
-        points_visual = points.reshape(-1, 3)
-    if torch.is_tensor(colors):
-        points_visual_rgb = colors.reshape(-1, 3).cpu().numpy()
-    else:
-        points_visual_rgb = colors.reshape(-1, 3)
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_visual.astype(np.float64))
-    pcd.colors = o3d.utility.Vector3dVector(points_visual_rgb.astype(np.float64))
-    o3d.io.write_point_cloud(filename, pcd, write_ascii=True)
-
-# Usage example
-save_ply(
-    batch["world_points"][0].reshape(-1, 3), 
-    batch["images"][0].permute(0, 2, 3, 1).reshape(-1, 3), 
-    "debug.ply"
-)
+```bash
+python ../scripts/export_uncertainty_head.py logs/v1.0.0/ckpts/checkpoint.pt vggt_uncertainty_head_v1.pt --temperature 1.015
 ```
 
-### Handling Unordered Sequences
+The export contains only the covariance branch (fp16, ≈0.4 GB) plus metadata (κ, shield ε, error convention, temperature, source checkpoint); `vggt.utils.checkpoint.load_vggt_with_uncertainty` combines it with the upstream VGGT-1B weights.
 
-For unordered sequences, you can check how we compute the ranking (similarity) between one frame and all other frames, as discussed in [Issue #82](https://github.com/facebookresearch/vggt/issues/82).
+## 5. Notes inherited from upstream
 
-### Expected Coordinate System
-
-Camera poses are expected to follow the OpenCV `camera-from-world` convention. Depth maps should be aligned with their corresponding camera poses.
+- Camera poses follow the OpenCV camera-from-world convention; depth maps are aligned with their cameras.
+- The learning rate depends on the effective batch size; try 5e-6 … 5e-4 if you change it.
+- To sanity-check the loader, dump `batch["world_points"]` to a PLY and inspect it (see the upstream VGGT repository for a snippet).
+- Multi-dataset training (`data.composed_dataset.ComposedDataset` with several `dataset_configs` and `len_train` ratios) works as upstream.

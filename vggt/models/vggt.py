@@ -40,6 +40,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         Returns:
             dict: A dictionary containing the following predictions:
                 - pose_enc (torch.Tensor): Camera pose encoding with shape [B, S, 9] (from the last iteration)
+                - cholesky_vector (torch.Tensor): 21 entries of the Cholesky factor of the 6x6 pose covariance, [B, S, 21]
+                  (see vggt.utils.uncertainty for the conventions and how to turn it into a covariance)
                 - depth (torch.Tensor): Predicted depth maps with shape [B, S, H, W, 1]
                 - depth_conf (torch.Tensor): Confidence scores for depth predictions with shape [B, S, H, W]
                 - world_points (torch.Tensor): 3D world coordinates for each pixel with shape [B, S, H, W, 3]
@@ -64,9 +66,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         with torch.cuda.amp.autocast(enabled=False):
             if self.camera_head is not None:
-                pose_enc_list = self.camera_head(aggregated_tokens_list)
-                predictions["pose_enc"] = pose_enc_list[-1]  # pose encoding of the last iteration
-                predictions["pose_enc_list"] = pose_enc_list
+                pose_outputs = self.camera_head(aggregated_tokens_list)
+                predictions["pose_enc"] = pose_outputs["pose_enc"]
+                predictions["cholesky_vector"] = pose_outputs["cholesky_vector"]
                 
             if self.depth_head is not None:
                 depth, depth_conf = self.depth_head(

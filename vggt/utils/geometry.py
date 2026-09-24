@@ -322,3 +322,174 @@ def cam_from_img(pred_tracks, intrinsics, extra_params=None):
             )
 
     return tracks_normalized
+
+# --- First-order propagation of pose + depth uncertainty to 3D points ---
+
+def _skew_symmetric_matrix_vectorized(vec: np.ndarray) -> np.ndarray:
+    """
+    Creates a vectorized skew-symmetric matrix from a vector.
+    [v_x, v_y, v_z] -> [[0, -v_z, v_y], [v_z, 0, -v_x], [-v_y, v_x, 0]]
+
+    Args:
+        vec (np.ndarray): A vector of shape (..., 3).
+
+    Returns:
+        np.ndarray: The skew-symmetric matrix of shape (..., 3, 3).
+    """
+    zeros = np.zeros_like(vec[..., :1])
+    skew = np.stack([
+        zeros, -vec[..., 2:3], vec[..., 1:2],
+        vec[..., 2:3], zeros, -vec[..., 0:1],
+        -vec[..., 1:2], vec[..., 0:1], zeros
+    ], axis=-1)
+    return skew.reshape(vec.shape[:-1] + (3, 3))
+
+
+def _propagate_pixel_uncertainty_vectorized(
+    depth_map: np.ndarray,
+    depth_conf: np.ndarray,
+    extrinsic: np.ndarray,
+    intrinsic: np.ndarray,
+    pose_covariance: np.ndarray,
+    depth_conf_to_variance_fn: callable
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Core vectorized function to propagate uncertainty for a single frame.
+
+    Args:
+        depth_map (np.ndarray): Depth map of shape (H, W).
+        depth_conf (np.ndarray): Depth confidence map of shape (H, W).
+        extrinsic (np.ndarray): Camera extrinsic matrix (cam from world), shape (3, 4).
+        intrinsic (np.ndarray): Camera intrinsic matrix, shape (3, 3).
+        pose_covariance (np.ndarray): 6x6 covariance of the pose twist (translation, rotation)
+            in the *predicted camera's frame* (body-centric convention, physical units - the
+            kappa weighting must already be undone; see vggt.utils.uncertainty).
+        depth_conf_to_variance_fn (callable): Function to convert confidence to variance.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray, np.ndarray]:
+            - world_points: (H, W, 3) 3D world coordinates.
+            - world_points_cov: (H, W, 3, 3) translational covariance for each 3D point.
+            - point_mask: (H, W) boolean mask of valid points.
+    """
+    H, W = depth_map.shape
+
+    # 1. Unproject to get points in camera and world coordinates (reusing existing logic)
+    world_points, cam_points, point_mask = depth_to_world_coords_points(depth_map, extrinsic, intrinsic)
+
+    # Flatten points for batch processing. We will only compute for valid points.
+    valid_cam_points = cam_points[point_mask] # Shape: (N_valid, 3)
+    N_valid = valid_cam_points.shape[0]
+
+    if N_valid == 0:
+        # If no valid points, return empty/zero arrays of the correct shape
+        world_points_cov = np.zeros((H, W, 3, 3), dtype=np.float32)
+        return world_points, world_points_cov, point_mask
+
+    # 2. Compute the Jacobian of the unprojection function w.r.t. pose and depth
+    # The unprojection function is P_world = f(pose, depth)
+    # The Jacobian J is a 3x7 matrix for each point: J = [∂P_world/∂t, ∂P_world/∂ω, ∂P_world/∂d]
+    # where t is translation (3), ω is rotation (3), and d is depth (1).
+
+    # Get inverse rotation (camera to world)
+    R_cam_to_world = closed_form_inverse_se3(extrinsic[None])[0][:3, :3] # Shape (3, 3)
+
+    # Jacobian w.r.t translation (J_t): ∂P_world / ∂t = -R_c^w
+    J_t = -R_cam_to_world # Shape: (3, 3)
+
+    # Jacobian w.r.t rotation (J_ω): ∂P_world / ∂ω = R_c^w * [P_cam]^x
+    # where [P_cam]^x is the skew-symmetric matrix of the point in camera coordinates.
+    skew_P_cam = _skew_symmetric_matrix_vectorized(valid_cam_points) # Shape: (N_valid, 3, 3)
+    J_omega = R_cam_to_world @ skew_P_cam # Shape: (N_valid, 3, 3) using broadcasting
+
+    # Jacobian w.r.t depth (J_d): ∂P_world / ∂d = R_c^w * (K^-1 * p_pixel)
+    # The term (K^-1 * p_pixel) is the normalized ray from the camera center.
+    # We can get this by dividing cam_points by depth.
+    valid_depths = depth_map[point_mask].reshape(-1, 1) # Shape: (N_valid, 1)
+    normalized_rays_cam = valid_cam_points / (valid_depths + 1e-8)
+    J_d = (R_cam_to_world @ normalized_rays_cam[..., np.newaxis]).squeeze(-1) # Shape: (N_valid, 3)
+
+    # Assemble the full Jacobian for all valid points
+    # J_t is constant for all points in a frame, so we expand it.
+    J_t_expanded = np.expand_dims(J_t, axis=0).repeat(N_valid, axis=0) # Shape: (N_valid, 3, 3)
+    J = np.concatenate([J_t_expanded, J_omega, J_d[:, :, np.newaxis]], axis=2) # Shape: (N_valid, 3, 7)
+
+    # 3. Assemble the 7x7 input covariance matrix for each point
+    # The top-left 6x6 is the pose covariance (same for all points)
+    # The bottom-right 1x1 is the depth variance (per-point)
+    depth_variances = depth_conf_to_variance_fn(depth_conf[point_mask]) # Shape: (N_valid,)
+    
+    # Create the block-diagonal input covariance matrix for all valid points
+    Sigma_in = np.zeros((N_valid, 7, 7), dtype=np.float32)
+    Sigma_in[:, :6, :6] = pose_covariance # Broadcast pose covariance to all points
+    Sigma_in[:, 6, 6] = depth_variances
+
+    # 4. Propagate the uncertainty using the formula: Cov_out = J * Cov_in * J^T
+    # We use np.einsum for efficient batch matrix multiplication.
+    # 'nij,njk,nkl->nil' -> for each point n, do J[i,j] @ Sigma_in[j,k] @ J.T[k,l]
+    J_T = J.transpose(0, 2, 1) # Shape: (N_valid, 7, 3)
+    world_points_cov_flat = np.einsum('nij,njk->nik', J, Sigma_in)
+    world_points_cov_flat = np.einsum('nij,njk->nik', world_points_cov_flat, J_T) # Shape: (N_valid, 3, 3)
+
+    # 5. Un-flatten the covariance matrix to match the image shape
+    world_points_cov = np.zeros((H, W, 3, 3), dtype=np.float32)
+    world_points_cov[point_mask] = world_points_cov_flat
+
+    return world_points, world_points_cov, point_mask
+
+
+def unproject_depth_map_with_uncertainty(
+    depth_map: np.ndarray,
+    depth_conf: np.ndarray,
+    extrinsics_cam: np.ndarray,
+    intrinsics_cam: np.ndarray,
+    pose_covariances: np.ndarray,
+    depth_conf_to_variance_fn: callable = lambda c: 1.0 / (c + 1e-6)
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Unproject a batch of depth maps to 3D world coordinates with uncertainty.
+
+    Args:
+        depth_map (np.ndarray): Batch of depth maps, shape (S, H, W, 1) or (S, H, W).
+        depth_conf (np.ndarray): Batch of depth confidences, shape (S, H, W).
+        extrinsics_cam (np.ndarray): Batch of extrinsic matrices, shape (S, 3, 4).
+        intrinsics_cam (np.ndarray): Batch of intrinsic matrices, shape (S, 3, 3).
+        pose_covariances (np.ndarray): Batch of 6x6 pose covariance matrices, shape (S, 6, 6), in
+            the predicted camera's frame with (translation, rotation) ordering and physical units
+            (use pose_covariances_from_predictions(..., frame="body")).
+        depth_conf_to_variance_fn (callable, optional): A function to convert a confidence
+            score to a variance value. Defaults to a simple inverse relationship.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]:
+            - world_points_array: Batch of 3D world coordinates, shape (S, H, W, 3).
+            - world_points_cov_array: Batch of 3x3 translational covariances, shape (S, H, W, 3, 3).
+    """
+    # Ensure inputs are numpy arrays
+    # (Your existing code already handles this, but it's good practice)
+    if isinstance(depth_map, torch.Tensor): depth_map = depth_map.cpu().numpy()
+    if isinstance(depth_conf, torch.Tensor): depth_conf = depth_conf.cpu().numpy()
+    if isinstance(extrinsics_cam, torch.Tensor): extrinsics_cam = extrinsics_cam.cpu().numpy()
+    if isinstance(intrinsics_cam, torch.Tensor): intrinsics_cam = intrinsics_cam.cpu().numpy()
+    if isinstance(pose_covariances, torch.Tensor): pose_covariances = pose_covariances.cpu().numpy()
+
+    world_points_list = []
+    world_points_cov_list = []
+
+    for frame_idx in range(depth_map.shape[0]):
+        # The core logic is now in a separate, vectorized function for clarity
+        cur_world_points, cur_world_points_cov, _ = _propagate_pixel_uncertainty_vectorized(
+            depth_map=depth_map[frame_idx].squeeze(),
+            depth_conf=depth_conf[frame_idx].squeeze(),
+            extrinsic=extrinsics_cam[frame_idx],
+            intrinsic=intrinsics_cam[frame_idx],
+            pose_covariance=pose_covariances[frame_idx],
+            depth_conf_to_variance_fn=depth_conf_to_variance_fn
+        )
+        world_points_list.append(cur_world_points)
+        world_points_cov_list.append(cur_world_points_cov)
+
+    world_points_array = np.stack(world_points_list, axis=0)
+    world_points_cov_array = np.stack(world_points_cov_list, axis=0)
+
+    return world_points_array, world_points_cov_array

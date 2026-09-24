@@ -22,6 +22,7 @@ import contextlib
 import gc
 import json
 import logging
+import logging as _logging  # Trainer.__init__ has a `logging` config argument that shadows the module
 import math
 import time
 from datetime import timedelta
@@ -41,6 +42,12 @@ from train_utils.general import *
 from train_utils.logging import setup_logging
 from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
 from train_utils.optimizer import construct_optimizers
+
+from vggt.models.vggt import VGGT
+
+
+# minimum number of valid depth points for a sample's scene scale to count as defined
+MIN_VALID_POINTS = 100
 
 
 class Trainer:
@@ -138,34 +145,82 @@ class Trainer:
             all_ranks=self.logging_conf.all_ranks,
         )
         set_seeds(seed_value, self.max_epochs, self.distributed_rank)
+        self._log_resolved_config()
 
         assert is_dist_avail_and_initialized(), "Torch distributed needs to be initialized before calling the trainer."
 
-        # Instantiate components (model, loss, etc.)
+        # --- RE-ORDERED LOGIC START ---
+
+        # 1. Instantiate ALL components first
         self._setup_components()
         self._setup_dataloaders()
-
-        # Move model to the correct device
         self.model.to(self.device)
         self.time_elapsed_meter = DurationMeter("Time Elapsed", self.device, ":.4f")
-
-        # Construct optimizers (after moving model to device)
-        if self.mode != "val":
-            self.optims = construct_optimizers(self.model, self.optim_conf)
-
-        # Load checkpoint if available or specified
-        if self.checkpoint_conf.resume_checkpoint_path is not None:
+        
+        # 2. Load the checkpoint and remap keys.
+        #    At this point, the model has its final architecture but all parameters are trainable.
+        #    A training run whose save_dir already holds a checkpoint resumes from it (weights,
+        #    epoch, optimizer, step counters); otherwise resume_checkpoint_path (the pretrained
+        #    VGGT weights, or a trained checkpoint to evaluate) is loaded.
+        self._pending_optimizer_state = None
+        own_ckpt = get_resume_checkpoint(self.checkpoint_conf.save_dir) if self.mode == "train" else None
+        if own_ckpt is not None:
+            _logging.info(f"Resuming the run from its own checkpoint {own_ckpt}")
+            self._load_resuming_checkpoint(own_ckpt)
+        elif self.checkpoint_conf.resume_checkpoint_path is not None:
             self._load_resuming_checkpoint(self.checkpoint_conf.resume_checkpoint_path)
-        else:   
-            ckpt_path = get_resume_checkpoint(self.checkpoint_conf.save_dir)
-            if ckpt_path is not None:
-                self._load_resuming_checkpoint(ckpt_path)
 
-        # Wrap the model with DDP
+        # 3. NOW, after weights are loaded, apply the freezing logic.
+        if self.mode == "train":
+            # Freeze the entire model by default
+            for param in self.model.parameters():
+                param.requires_grad = False
+            
+            # Unfreeze only the uncertainty pathway (the covariance branch).
+            if self.model.camera_head is not None:
+                trainable_modules = [self.model.camera_head.covariance_branch]
+                for module in trainable_modules:
+                    for param in module.parameters():
+                        param.requires_grad = True
+
+            trainable = [n for n, p in self.model.named_parameters() if p.requires_grad]
+            n_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            _logging.info(f"Trainable parameters ({len(trainable)} tensors, {n_trainable/1e6:.1f}M params): {trainable}")
+            
+            # 4. Construct optimizers with the correctly filtered parameters, then restore their
+            #    state when resuming (it could not be loaded before the optimizers existed).
+            self.optims = construct_optimizers(self.model, self.optim_conf)
+            if self._pending_optimizer_state is not None:
+                states = self._pending_optimizer_state
+                states = states if isinstance(states, list) else [states]
+                assert len(states) == len(self.optims), "optimizer count differs from the checkpoint"
+                for optim, state in zip(self.optims, states):
+                    optim.optimizer.load_state_dict(state)
+                _logging.info(f"Restored the optimizer state; continuing at epoch {self.epoch}")
+
+        # 5. Wrap the model with DDP *LAST*.
         self._setup_ddp_distributed_training(distributed, device)
         
-        # Barrier to ensure all processes are synchronized before starting
         dist.barrier()
+        # --- RE-ORDERED LOGIC END ---
+
+    def _log_resolved_config(self):
+        """Record the effective run configuration in the log file (reproducibility)."""
+        from omegaconf import OmegaConf
+
+        def dump(cfg):
+            try:
+                return OmegaConf.to_yaml(cfg, resolve=True)
+            except Exception:
+                return str(cfg)
+
+        logging.info(
+            "Resolved run configuration\n"
+            f"mode: {self.mode} | max_epochs: {self.max_epochs} | accum_steps: {self.accum_steps} | "
+            f"limit_train_batches: {self.limit_train_batches} | limit_val_batches: {self.limit_val_batches} | seed: {self.seed_value}\n"
+            f"checkpoint:\n{dump(self.checkpoint_conf)}\nloss:\n{dump(self.loss_conf)}\noptim:\n{dump(self.optim_conf)}\n"
+            f"model:\n{dump(self.model_conf)}"
+        )
 
     def _setup_timers(self):
         """Initializes timers for tracking total elapsed time."""
@@ -177,7 +232,7 @@ class Trainer:
         if env_variables_conf:
             for variable_name, value in env_variables_conf.items():
                 os.environ[variable_name] = value
-        logging.info(f"Environment:\n{json.dumps(dict(os.environ), sort_keys=True, indent=2)}")
+        print(f"Environment:\n{json.dumps(dict(os.environ), sort_keys=True, indent=2)}")
 
     def _setup_torch_dist_and_backend(self, cuda_conf: Dict, distributed_conf: Dict) -> None:
         """Initializes the distributed process group and configures PyTorch backends."""
@@ -196,34 +251,64 @@ class Trainer:
         self.rank = dist.get_rank()
 
     def _load_resuming_checkpoint(self, ckpt_path: str):
-        """Loads a checkpoint from the given path to resume training."""
-        logging.info(f"Resuming training from {ckpt_path} (rank {self.rank})")
+        """
+        Loads a checkpoint, handles key remapping for the camera head, and then
+        loads the state into the model.
+        """
+        logging.info(f"Loading checkpoint {ckpt_path} (rank {self.rank})")
 
         with g_pathmgr.open(ckpt_path, "rb") as f:
             checkpoint = torch.load(f, map_location="cpu")
         
-        # Load model state
-        model_state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
+        # Extract the state dictionary
+        state_dict_from_file = checkpoint.get("model", checkpoint)
+
+        # --- Manual Key Remapping for Camera Head's MEAN branch ---
+        # We renamed the original 'pose_branch' to 'mean_pose_branch'.
+        # We must remap the keys from the checkpoint to load the pre-trained weights.
+        keys_to_remap = [k for k in state_dict_from_file if k.startswith("camera_head.pose_branch")]
+        
+        if self.rank == 0 and keys_to_remap:
+            print(f"Remapping {len(keys_to_remap)} pre-trained keys from 'pose_branch' to 'mean_pose_branch'.")
+
+        for old_key in keys_to_remap:
+            new_key = old_key.replace("camera_head.pose_branch", "camera_head.mean_pose_branch")
+            state_dict_from_file[new_key] = state_dict_from_file.pop(old_key)
+
+        # --- Load the modified state dictionary ---
+        # `strict=False` is crucial. It allows the loading to succeed even though:
+        #   1. The checkpoint is missing keys for our new `covariance_branch`.
+        #   2. The checkpoint has keys for `point_head`, `depth_head`, etc., which are disabled in our model.
         missing, unexpected = self.model.load_state_dict(
-            model_state_dict, strict=self.checkpoint_conf.strict
+            state_dict_from_file, strict=False
         )
+        
         if self.rank == 0:
-            logging.info(f"Model state loaded. Missing keys: {missing or 'None'}. Unexpected keys: {unexpected or 'None'}.")
+            print("--- State Dict Loading Summary ---")
+            # Filter missing keys to only show ones we didn't expect to be missing
+            expected_missing = [k for k in missing if "covariance_branch" in k]
+            unexpected_missing = [k for k in missing if "covariance_branch" not in k]
+            print(f"Successfully loaded pretrained weights for trunk and mean_pose_branch.")
+            print(f"Found {len(expected_missing)} expected missing keys for the new covariance_branch (will be randomly initialized).")
+            if unexpected_missing:
+                logging.warning(f"UNEXPECTED MISSING KEYS: {unexpected_missing}")
 
-        # Load optimizer state if available and in training mode
-        if "optimizer" in checkpoint:
-            logging.info(f"Loading optimizer state dict (rank {self.rank})")
-            self.optims.optimizer.load_state_dict(checkpoint["optimizer"])
+            print(f"Ignored unexpected keys from checkpoint: {unexpected or 'None'}")
+            print("------------------------------------")
+        
+        # --- Load training progress if available in the checkpoint ---
+        if isinstance(checkpoint, dict):
+            # save_checkpoint stores "prev_epoch", the last completed epoch
+            if "prev_epoch" in checkpoint and self.mode == "train":
+                self.epoch = int(checkpoint["prev_epoch"]) + 1
+                self._pending_optimizer_state = checkpoint.get("optimizer")
+                if "train_batch_sampler_rng" in checkpoint and getattr(self, "train_dataset", None) is not None:
+                    self.train_dataset.batch_sampler.rng.setstate(checkpoint["train_batch_sampler_rng"])
+            self.steps = checkpoint.get("steps", {"train": 0, "val": 0})
+            self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
 
-        # Load training progress
-        if "epoch" in checkpoint:
-            self.epoch = checkpoint["epoch"]
-        self.steps = checkpoint["steps"] if "steps" in checkpoint else {"train": 0, "val": 0}
-        self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
-
-        # Load AMP scaler state if available
-        if self.optim_conf.amp.enabled and "scaler" in checkpoint:
-            self.scaler.load_state_dict(checkpoint["scaler"])
+            if self.optim_conf.amp.enabled and "scaler" in checkpoint and hasattr(self, "scaler"):
+                self.scaler.load_state_dict(checkpoint["scaler"])
 
     def _setup_device(self, device: str):
         """Sets up the device for training (CPU or CUDA)."""
@@ -238,7 +323,7 @@ class Trainer:
 
     def _setup_components(self):
         """Initializes all core training components using Hydra configs."""
-        logging.info("Setting up components: Model, Loss, Logger, etc.")
+        print("Setting up components: Model, Loss, Logger, etc.")
         self.epoch = 0
         self.steps = {'train': 0, 'val': 0}
 
@@ -251,14 +336,14 @@ class Trainer:
 
         # Freeze specified model parameters if any
         if getattr(self.optim_conf, "frozen_module_names", None):
-            logging.info(
+            print(
                 f"[Start] Freezing modules: {self.optim_conf.frozen_module_names} on rank {self.distributed_rank}"
             )
             self.model = freeze_modules(
                 self.model,
                 patterns=self.optim_conf.frozen_module_names,
             )
-            logging.info(
+            print(
                 f"[Done] Freezing modules: {self.optim_conf.frozen_module_names} on rank {self.distributed_rank}"
             )
 
@@ -266,9 +351,9 @@ class Trainer:
         if self.rank == 0:
             model_summary_path = os.path.join(self.logging_conf.log_dir, "model.txt")
             model_summary(self.model, log_file=model_summary_path)
-            logging.info(f"Model summary saved to {model_summary_path}")
+            print(f"Model summary saved to {model_summary_path}")
 
-        logging.info("Successfully initialized training components.")
+        print("Successfully initialized training components.")
 
     def _setup_dataloaders(self):
         """Initializes train and validation datasets and dataloaders."""
@@ -332,6 +417,10 @@ class Trainer:
         
         if len(self.optims) == 1:
             checkpoint_content["optimizer"] = checkpoint_content["optimizer"][0]
+        # The batch sampler draws aspect ratios from an RNG that is seeded once and carries over
+        # from epoch to epoch; saving its state makes a resumed run see the same batches.
+        if getattr(self, "train_dataset", None) is not None:
+            checkpoint_content["train_batch_sampler_rng"] = self.train_dataset.batch_sampler.rng.getstate()
         if self.optim_conf.amp.enabled:
             checkpoint_content["scaler"] = self.scaler.state_dict()
 
@@ -403,7 +492,7 @@ class Trainer:
     def run_val(self):
         """Runs a full validation epoch if a validation dataset is available."""
         if not self.val_dataset:
-            logging.info("No validation dataset configured. Skipping validation.")
+            print("No validation dataset configured. Skipping validation.")
             return
 
         dataloader = self.val_dataset.get_loader(epoch=int(self.epoch))
@@ -425,6 +514,10 @@ class Trainer:
         
         loss_names = self._get_scalar_log_keys(phase)
         loss_names = [f"Loss/{phase}_{name}" for name in loss_names]
+        # Always add the objective loss key since it's used in _run_steps_on_batch_chunks
+        objective_loss_key = f"Loss/{phase}_loss_objective"
+        if objective_loss_key not in loss_names:
+            loss_names.append(objective_loss_key)
         loss_meters = {
             name: AverageMeter(name, self.device, ":.4f") for name in loss_names
         }
@@ -452,8 +545,10 @@ class Trainer:
             else self.limit_val_batches
         )
 
+        per_frame = {} 
+
         for data_iter, batch in enumerate(val_loader):
-            if data_iter > limit_val_batches:
+            if data_iter >= limit_val_batches:
                 break
             
             # measure data loading time
@@ -461,7 +556,7 @@ class Trainer:
             data_times.append(data_time.val)
             
             with torch.cuda.amp.autocast(enabled=False):
-                batch = self._process_batch(batch)
+                batch = self._process_batch(batch, phase)
             batch = copy_data_to_device(batch, self.device, non_blocking=True)
 
             amp_type = self.optim_conf.amp.amp_dtype
@@ -481,6 +576,10 @@ class Trainer:
                         batch, self.model, phase, loss_meters
                     )
 
+            for k, v in val_loss_dict.items():
+                if k.startswith("raw_"):
+                    per_frame.setdefault(k[len("raw_"):], []).append(v.flatten())
+
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
@@ -495,6 +594,14 @@ class Trainer:
             if data_iter % self.logging_conf.log_freq == 0:
                 progress.display(data_iter)
 
+        if per_frame and self.rank == 0:
+            # Per-frame values of all evaluated (non-reference) frames for calibration analysis
+            # with plot_calibration.py: squared Mahalanobis distance, log-determinant of the
+            # covariance and the translation / rotation error of the pose.
+            arrays = {k: torch.cat(v).to(torch.float32).numpy() for k, v in per_frame.items()}
+            save_path = os.path.join(self.logging_conf.log_dir, f"calibration_epoch_{self.epoch}.npz")
+            np.savez(save_path, **arrays)
+            logging.info(f"Saved {arrays['mahalanobis_sq'].size} calibration samples to {save_path}")
 
         return True
 
@@ -507,6 +614,10 @@ class Trainer:
         
         loss_names = self._get_scalar_log_keys(phase)
         loss_names = [f"Loss/{phase}_{name}" for name in loss_names]
+        # Always add the objective loss key since it's used in _run_steps_on_batch_chunks
+        objective_loss_key = f"Loss/{phase}_loss_objective"
+        if objective_loss_key not in loss_names:
+            loss_names.append(objective_loss_key)
         loss_meters = {
             name: AverageMeter(name, self.device, ":.4f") for name in loss_names
         }
@@ -544,7 +655,7 @@ class Trainer:
             self.gradient_clipper.setup_clipping(self.model)
 
         for data_iter, batch in enumerate(train_loader):
-            if data_iter > limit_train_batches:
+            if data_iter >= limit_train_batches:
                 break
             
             # measure data loading time
@@ -553,7 +664,7 @@ class Trainer:
 
             
             with torch.cuda.amp.autocast(enabled=False):
-                batch = self._process_batch(batch)
+                batch = self._process_batch(batch, phase)
 
             batch = copy_data_to_device(batch, self.device, non_blocking=True)
 
@@ -608,10 +719,11 @@ class Trainer:
                 )
 
             # Clipping gradients and detecting diverging gradients
+            # CRITICAL: Always unscale gradients before step() to ensure inf checks are recorded
+            for optim in self.optims:
+                self.scaler.unscale_(optim.optimizer)
+            
             if self.gradient_clipper is not None:
-                for optim in self.optims:
-                    self.scaler.unscale_(optim.optimizer)
-
                 grad_norm_dict = self.gradient_clipper(model=self.model)
 
                 for key, grad_norm in grad_norm_dict.items():
@@ -713,12 +825,18 @@ class Trainer:
         
         return batch
 
-    def _process_batch(self, batch: Mapping):      
-        if self.data_conf.train.common_config.repeat_batch:
+    def _process_batch(self, batch: Mapping, phase: str = "train"):
+        """Normalize the batch (world frame = camera 0, unit scene scale) and record the scale.
+
+        Batch repetition (concatenating a frame-reversed copy) is a training-time
+        augmentation only; validation batches are used as loaded.
+        """
+        if phase == "train" and self.data_conf.train.common_config.repeat_batch:
             batch = self._apply_batch_repetition(batch)
-        
-        # Normalize camera extrinsics and points. The function returns new tensors.
-        normalized_extrinsics, normalized_cam_points, normalized_world_points, normalized_depths = \
+
+        # The normalization function also returns the scale it divided out; it is kept in
+        # the batch for logging (poses and the loss live in the normalized frame).
+        normalized_extrinsics, normalized_cam_points, normalized_world_points, normalized_depths, scene_scale = \
             normalize_camera_extrinsics_and_points_batch(
                 extrinsics=batch["extrinsics"],
                 cam_points=batch["cam_points"],
@@ -732,6 +850,10 @@ class Trainer:
         batch["cam_points"] = normalized_cam_points
         batch["world_points"] = normalized_world_points
         batch["depths"] = normalized_depths
+        batch["scene_scale"] = scene_scale
+        # A sample whose depth masks leave (almost) no valid point has no defined scene scale:
+        # the normalization clamps it to 1e-6 and the translations explode.  The loss skips it.
+        batch["scene_scale_valid"] = batch["point_masks"].sum(dim=[1, 2, 3]) >= MIN_VALID_POINTS
 
         return batch
 
@@ -745,8 +867,8 @@ class Trainer:
         # Forward pass
         y_hat = model(images=batch["images"])
         
-        # Loss computation
-        loss_dict = self.loss(y_hat, batch)
+        # Loss computation (the loss implements the warm-up / annealing curriculum)
+        loss_dict = self.loss(y_hat, batch, epoch=self.epoch, total_epochs=self.max_epochs, phase=phase)
         
         # Combine all data for logging
         log_data = {**y_hat, **loss_dict, **batch}

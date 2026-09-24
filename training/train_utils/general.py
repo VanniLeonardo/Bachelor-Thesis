@@ -26,7 +26,7 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 
 
 
-def check_and_fix_inf_nan(input_tensor, loss_name="default", hard_max=100):
+def check_and_fix_inf_nan(input_tensor, loss_name="default", hard_max=None):
     """
     Checks if 'input_tensor' contains inf or nan values and clamps extreme values.
     

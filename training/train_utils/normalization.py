@@ -93,24 +93,24 @@ def normalize_camera_extrinsics_and_points_batch(
         new_world_points = None
 
 
-    if scale_by_points:
-        new_cam_points = cam_points.clone()
-        new_depths = depths.clone()
+    # if scale_by_points:
+    new_cam_points = cam_points.clone()
+    new_depths = depths.clone()
 
-        dist = new_world_points.norm(dim=-1)
-        dist_sum = (dist * point_masks).sum(dim=[1,2,3])
-        valid_count = point_masks.sum(dim=[1,2,3])
-        avg_scale = (dist_sum / (valid_count + 1e-3)).clamp(min=1e-6, max=1e6)
+    dist = new_world_points.norm(dim=-1)
+    dist_sum = (dist * point_masks).sum(dim=[1,2,3])
+    valid_count = point_masks.sum(dim=[1,2,3])
+    avg_scale = (dist_sum / (valid_count + 1e-3)).clamp(min=1e-6, max=1e6)
 
 
-        new_world_points = new_world_points / avg_scale.view(-1, 1, 1, 1, 1)
-        new_extrinsics[:, :, :3, 3] = new_extrinsics[:, :, :3, 3] / avg_scale.view(-1, 1, 1)
-        if depths is not None:
-            new_depths = new_depths / avg_scale.view(-1, 1, 1, 1)
-        if cam_points is not None:
-            new_cam_points = new_cam_points / avg_scale.view(-1, 1, 1, 1, 1)
-    else:
-        return new_extrinsics[:, :, :3], cam_points, new_world_points, depths
+    new_world_points = new_world_points / avg_scale.view(-1, 1, 1, 1, 1)
+    new_extrinsics[:, :, :3, 3] = new_extrinsics[:, :, :3, 3] / avg_scale.view(-1, 1, 1)
+    if depths is not None:
+        new_depths = new_depths / avg_scale.view(-1, 1, 1, 1)
+    if cam_points is not None:
+        new_cam_points = new_cam_points / avg_scale.view(-1, 1, 1, 1, 1)
+    # else:
+    #     return new_extrinsics[:, :, :3], cam_points, new_world_points, depths, torch.ones(B, device=device)
 
     new_extrinsics = new_extrinsics[:, :, :3] # 4x4 -> 3x4
     new_extrinsics = check_and_fix_inf_nan(new_extrinsics, "new_extrinsics", hard_max=None)
@@ -119,9 +119,5 @@ def normalize_camera_extrinsics_and_points_batch(
     new_depths = check_and_fix_inf_nan(new_depths, "new_depths", hard_max=None)
 
 
-    return new_extrinsics, new_cam_points, new_world_points, new_depths
-
-
-
-
+    return new_extrinsics, new_cam_points, new_world_points, new_depths, avg_scale
 

@@ -17,6 +17,7 @@ import numpy as np
 
 from data.dataset_util import *
 from data.base_dataset import BaseDataset
+from data.archive_store import ArchiveStore, frame_members, read_manifest
 
 
 SEEN_CATEGORIES = [
@@ -71,6 +72,8 @@ class Co3dDataset(BaseDataset):
         split: str = "train",
         CO3D_DIR: str = None,
         CO3D_ANNOTATION_DIR: str = None,
+        storage: str = "auto",
+        sequences_file: str = None,
         min_num_images: int = 24,
         len_train: int = 100000,
         len_test: int = 10000,
@@ -83,6 +86,8 @@ class Co3dDataset(BaseDataset):
             split (str): Dataset split, either 'train' or 'test'.
             CO3D_DIR (str): Directory path to CO3D data.
             CO3D_ANNOTATION_DIR (str): Directory path to CO3D annotations.
+            sequences_file (str): Optional text file with one sequence name per line; only these
+                sequences are used (relative paths are resolved against the training/ folder).
             min_num_images (int): Minimum number of images per sequence.
             len_train (int): Length of the training dataset.
             len_test (int): Length of the test dataset.
@@ -103,8 +108,8 @@ class Co3dDataset(BaseDataset):
 
         category = sorted(SEEN_CATEGORIES)
 
-        if self.debug:
-            category = ["apple"]
+        # if self.debug:
+        #     category = ["car"]
 
         if split == "train":
             split_name_list = ["train"]
@@ -116,6 +121,13 @@ class Co3dDataset(BaseDataset):
             raise ValueError(f"Invalid split: {split}")
 
         self.invalid_sequence = [] # set any invalid sequence names here
+        self.allowed_sequences = None
+        if sequences_file is not None:
+            if not osp.isabs(sequences_file):
+                sequences_file = osp.join(osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__)))), sequences_file)
+            with open(sequences_file) as f:
+                self.allowed_sequences = {line.strip() for line in f if line.strip()}
+            logging.info(f"Restricting {split} split to {len(self.allowed_sequences)} sequences from {sequences_file}")
 
 
         self.category_map = {}
@@ -128,7 +140,23 @@ class Co3dDataset(BaseDataset):
         self.CO3D_DIR = CO3D_DIR
         self.CO3D_ANNOTATION_DIR = CO3D_ANNOTATION_DIR
 
+        # Frames may live as loose files or inside one uncompressed zip per sequence
+        # (see data/archive_store.py).  "auto" picks archives when the manifest exists.
+        if storage not in ("auto", "files", "archives"):
+            raise ValueError(f"storage must be auto, files or archives, got {storage!r}")
+        manifest = read_manifest(CO3D_DIR) if storage in ("auto", "archives") else {}
+        if storage == "archives" and not manifest:
+            raise FileNotFoundError(
+                f"storage='archives' but no frame manifest in {CO3D_DIR}; run scripts/repack_co3d.py"
+            )
+        self.storage = "archives" if manifest else "files"
+        self.archive_store = ArchiveStore(CO3D_DIR) if self.storage == "archives" else None
+        available = {seq: set(frames) for seq, frames in manifest.items()}
+        logging.info(f"CO3D storage mode: {self.storage}")
+
         total_frame_num = 0
+        total_sequences_before_filtering = 0
+        total_sequences_after_filtering = 0
 
         for c in category:
             for split_name in split_name_list:
@@ -144,12 +172,36 @@ class Co3dDataset(BaseDataset):
                     continue
 
                 for seq_name, seq_data in annotation.items():
-                    if len(seq_data) < min_num_images:
-                        continue
+                    total_sequences_before_filtering += 1
                     if seq_name in self.invalid_sequence:
                         continue
-                    total_frame_num += len(seq_data)
-                    self.data_store[seq_name] = seq_data
+                    if self.allowed_sequences is not None and seq_name not in self.allowed_sequences:
+                        continue
+
+                    # Keep only the frames whose files are actually present, so a
+                    # partially downloaded dataset still trains.
+                    if self.storage == "archives":
+                        present = available.get(seq_name)
+                        if not present:
+                            continue
+                        valid_frames_in_sequence = [f for f in seq_data if f["filepath"] in present]
+                    else:
+                        valid_frames_in_sequence = []
+                        for frame_data in seq_data:
+                            paths = frame_members(frame_data["filepath"])
+                            if all(osp.exists(osp.join(self.CO3D_DIR, p)) for p in paths.values()):
+                                valid_frames_in_sequence.append(frame_data)
+
+                    if len(valid_frames_in_sequence) < self.min_num_images:
+                        continue
+
+                    self.data_store[seq_name] = valid_frames_in_sequence
+                    total_frame_num += len(valid_frames_in_sequence)
+                    total_sequences_after_filtering += 1
+
+        # Add some logging to see the effect of filtering
+        logging.info(f"[{split.upper()}] Filtered dataset: Kept {total_sequences_after_filtering} out of {total_sequences_before_filtering} sequences.")
+        logging.info(f"[{split.upper()}] Total valid frames available for training: {total_frame_num}")
 
         self.sequence_list = list(self.data_store.keys())
         self.sequence_list_len = len(self.sequence_list)
@@ -209,18 +261,23 @@ class Co3dDataset(BaseDataset):
 
         for anno in annos:
             filepath = anno["filepath"]
-
+            members = frame_members(filepath)
             image_path = osp.join(self.CO3D_DIR, filepath)
-            image = read_image_cv2(image_path)
+
+            if self.storage == "archives":
+                image = decode_image_cv2(self.archive_store.read(members["image"]))
+            else:
+                image = read_image_cv2(image_path)
 
             if self.load_depth:
-                depth_path = image_path.replace("/images", "/depths") + ".geometric.png"
-                depth_map = read_depth(depth_path, 1.0)
+                if self.storage == "archives":
+                    depth_map = decode_depth(self.archive_store.read(members["depth"]), 1.0)
+                    mvs_mask = decode_mask_gray(self.archive_store.read(members["depth_mask"])) > 128
+                else:
+                    depth_map = read_depth(osp.join(self.CO3D_DIR, members["depth"]), 1.0)
+                    mvs_mask = cv2.imread(osp.join(self.CO3D_DIR, members["depth_mask"]), cv2.IMREAD_GRAYSCALE) > 128
 
-                mvs_mask_path = image_path.replace(
-                    "/images", "/depth_masks"
-                ).replace(".jpg", ".png")
-                mvs_mask = cv2.imread(mvs_mask_path, cv2.IMREAD_GRAYSCALE) > 128
+                # The MVS mask marks depths the multi-view stereo stage considered reliable.
                 depth_map[~mvs_mask] = 0
 
                 depth_map = threshold_depth_map(

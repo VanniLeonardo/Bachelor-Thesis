@@ -1,283 +1,133 @@
 <div align="center">
-<h1>VGGT: Visual Geometry Grounded Transformer</h1>
+<h1>VGGT with Camera-Pose Uncertainty</h1>
 
-<a href="https://jytime.github.io/data/VGGT_CVPR25.pdf" target="_blank" rel="noopener noreferrer">
-  <img src="https://img.shields.io/badge/Paper-VGGT" alt="Paper PDF">
-</a>
-<a href="https://arxiv.org/abs/2503.11651"><img src="https://img.shields.io/badge/arXiv-2503.11651-b31b1b" alt="arXiv"></a>
-<a href="https://vgg-t.github.io/"><img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page"></a>
-<a href='https://huggingface.co/spaces/facebook/vggt'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Demo-blue'></a>
+<p>A probabilistic extension of <a href="https://github.com/facebookresearch/vggt">VGGT</a> (CVPR 2025) that predicts a full 6×6 covariance for every estimated camera pose, in a single feed-forward pass.</p>
 
-
-**[Visual Geometry Group, University of Oxford](https://www.robots.ox.ac.uk/~vgg/)**; **[Meta AI](https://ai.facebook.com/research/)**
-
-
-[Jianyuan Wang](https://jytime.github.io/), [Minghao Chen](https://silent-chen.github.io/), [Nikita Karaev](https://nikitakaraevv.github.io/), [Andrea Vedaldi](https://www.robots.ox.ac.uk/~vedaldi/), [Christian Rupprecht](https://chrirupp.github.io/), [David Novotny](https://d-novotny.github.io/)
+<a href="https://github.com/facebookresearch/vggt"><img src="https://img.shields.io/badge/Upstream-facebookresearch%2Fvggt-blue" alt="Upstream"></a>
+<a href="./LICENSE.txt"><img src="https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey" alt="License"></a>
 </div>
 
-```bibtex
-@inproceedings{wang2025vggt,
-  title={VGGT: Visual Geometry Grounded Transformer},
-  author={Wang, Jianyuan and Chen, Minghao and Karaev, Nikita and Vedaldi, Andrea and Rupprecht, Christian and Novotny, David},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  year={2025}
-}
-```
+This repository accompanies the bachelor's thesis *Geometrically-Grounded Uncertainty Quantification for Foundational 3D Vision Models* (Leonardo Vanni, Bocconi University, 2026). VGGT's `CameraHead` is kept frozen and extended with a parallel *covariance branch* that outputs the Cholesky factor of a Gaussian over the pose error on the Lie algebra se(3). The frozen VGGT-1B backbone and mean-pose pathway are bit-identical to the upstream release, so point estimates are unchanged; only the uncertainty head is trained.
 
-## Updates
-- [July 6, 2025] Training code is now available in the `training` folder, including an example to finetune VGGT on a custom dataset. 
+> **Note on the thesis version.** The code released here fixes several bugs found while preparing it for publication and is a slightly modified version of the code used for the thesis experiments. The revised thesis (v2) reports numbers recomputed with this code.
 
+## What is added
 
-- [June 13, 2025] Honored to receive the Best Paper Award at CVPR 2025! Apologies if I’m slow to respond to queries or GitHub issues these days. If you’re interested, our oral presentation is available [here](https://docs.google.com/presentation/d/1JVuPnuZx6RgAy-U5Ezobg73XpBi7FrOh/edit?usp=sharing&ouid=107115712143490405606&rtpof=true&sd=true). Another long presentation can be found [here](https://docs.google.com/presentation/d/1aSv0e5PmH1mnwn2MowlJIajFUYZkjqgw/edit?usp=sharing&ouid=107115712143490405606&rtpof=true&sd=true) (Note: it’s shared in .pptx format with animations — quite large, but feel free to use it as a template if helpful.)
+- `vggt/heads/camera_head.py`: the covariance branch (an MLP on the aggregator camera token and the trunk's final hidden state) producing 21 Cholesky parameters per camera; the upstream pose pathway is renamed `mean_pose_branch` and frozen.
+- `vggt/utils/uncertainty.py`: the SE(3) machinery shared by training and inference: numerically stable log map, body-centric error twist, Cholesky parameterisation, κ-weighted metric, Gaussian NLL, and helpers to turn the network output into covariances in physical units (scene units, radians), in the camera or world frame, plus 95% ellipsoids and optical-axis cones.
+- `training/loss.py`: the scale-aware NLL with the three regularizers (scale, condition number, isotropy) and the warm-up / annealing curriculum; `training/trainer.py` trains only the covariance branch.
+- `vggt/utils/checkpoint.py`: loads VGGT-1B plus the small head-only checkpoint distributed with this repository.
+- `demo_viser.py`, `demo_gradio.py`: upstream demos extended with uncertainty ellipsoids and cones.
+- `plot_calibration.py`: temperature fitting and calibration plots from the validation output.
+- `scripts/`: CO3D repacking into one zip per sequence, the calibration/evaluation split of the test set, the COLMAP bundle-adjustment baseline in VGGT's gauge, the comparison with it, and rendering of the uncertainty inside the reconstructed scene.
+- `reproduce/`: commands, splits, COLMAP models and frames behind every table and figure of the revised thesis.
+- `tests/`: CPU unit tests for the geometry, the loss, the loaders and the baseline.
 
-
-- [June 2, 2025] Added a script to run VGGT and save predictions in COLMAP format, with bundle adjustment support optional. The saved COLMAP files can be directly used with [gsplat](https://github.com/nerfstudio-project/gsplat) or other NeRF/Gaussian splatting libraries.
-
-
-- [May 3, 2025] Evaluation code for reproducing our camera pose estimation results on Co3D is now available in the [evaluation](https://github.com/facebookresearch/vggt/tree/evaluation) branch. 
-
-
-## Overview
-
-Visual Geometry Grounded Transformer (VGGT, CVPR 2025) is a feed-forward neural network that directly infers all key 3D attributes of a scene, including extrinsic and intrinsic camera parameters, point maps, depth maps, and 3D point tracks, **from one, a few, or hundreds of its views, within seconds**.
-
-
-## Quick Start
-
-First, clone this repository to your local machine, and install the dependencies (torch, torchvision, numpy, Pillow, and huggingface_hub). 
+## Installation
 
 ```bash
-git clone git@github.com:facebookresearch/vggt.git 
-cd vggt
-pip install -r requirements.txt
+git clone https://github.com/VanniLeonardo/Bachelor-Thesis.git
+cd Bachelor-Thesis
+pip install -r requirements.txt          # torch, torchvision, numpy, Pillow, huggingface_hub, einops, safetensors
+pip install -e .                         # the `vggt` package
+pip install -r requirements_demo.txt     # optional: viser / gradio demos
+pip install -r requirements_train.txt    # optional: training and evaluation
 ```
 
-Alternatively, you can install VGGT as a package (<a href="docs/package.md">click here</a> for details).
+Python ≥ 3.10; tested with torch 2.3.1 / CUDA 12.1 on a single 24 GB GPU. Set `VGGT_PRETRAINED_CKPT` to a local copy of the upstream `model.pt` to avoid re-downloading it.
 
+## Weights
 
-Now, try the model with just a few lines of code:
+| File | Contents | Size |
+|---|---|---|
+| `facebook/VGGT-1B` `model.pt` | upstream VGGT-1B (downloaded automatically) | 5.0 GB |
+| `vggt_uncertainty_head_v1.pt` | covariance branch + metadata (κ, shield, error convention, fitted temperature) | ≈0.4 GB (fp16) |
+
+The head file will be published on the Hugging Face Hub with the v1.0.0 release; until then train it with the instructions below. Everything else is loaded from the upstream weights.
+
+## Quick start
 
 ```python
 import torch
-from vggt.models.vggt import VGGT
+from vggt.utils.checkpoint import load_vggt_with_uncertainty
 from vggt.utils.load_fn import load_and_preprocess_images
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from vggt.utils.uncertainty import pose_covariances_from_predictions, camera_centers, rotation_std_deg
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-# bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+) 
-dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+model, meta = load_vggt_with_uncertainty("vggt_uncertainty_head_v1.pt", device=device)
 
-# Initialize the model and load the pretrained weights.
-# This will automatically download the model weights the first time it's run, which may take a while.
-model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+images = load_and_preprocess_images(["img1.png", "img2.png", "img3.png"]).to(device)
+with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16):
+    pred = model(images)                                   # pose_enc (1,S,9), cholesky_vector (1,S,21), depth, ...
 
-# Load and preprocess example images (replace with your own image paths)
-image_names = ["path/to/imageA.png", "path/to/imageB.png", "path/to/imageC.png"]  
-images = load_and_preprocess_images(image_names).to(device)
-
-with torch.no_grad():
-    with torch.cuda.amp.autocast(dtype=dtype):
-        # Predict attributes including cameras, depth maps, and point maps.
-        predictions = model(images)
+extrinsic, intrinsic = pose_encoding_to_extri_intri(pred["pose_enc"], images.shape[-2:])
+E = extrinsic[0].float().cpu().numpy()                    # (S, 3, 4) camera-from-world
+Sigma_body = pose_covariances_from_predictions(pred["cholesky_vector"][0], E, kappa=meta["kappa"],
+                                               temperature=meta["temperature"], frame="body")
+Sigma_world = pose_covariances_from_predictions(pred["cholesky_vector"][0], E, kappa=meta["kappa"],
+                                               temperature=meta["temperature"], frame="world")
+print(camera_centers(E))                                   # (S, 3) camera centres in world coordinates
+print(Sigma_world[:, :3, :3])                              # translational covariance of each centre (scene units^2)
+print(rotation_std_deg(Sigma_body))                        # per-axis rotational std-dev in degrees
 ```
 
-The model weights will be automatically downloaded from Hugging Face. If you encounter issues such as slow loading, you can manually download them [here](https://huggingface.co/facebook/VGGT-1B/blob/main/model.pt) and load, or:
+### Conventions (read this before using the covariances)
 
-```python
-model = VGGT()
-_URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
-```
+- Extrinsics are 3×4 **camera-from-world** matrices (OpenCV), as in VGGT. Poses are in VGGT's normalized frame: camera 0 is the identity and the mean point distance from it is 1.
+- The twist is ordered **(translation, rotation)**. The Gaussian is defined on the error `ξ = log(E_pred · E_gt⁻¹)`, i.e. `P_gt = P_pred · Exp(ξ)` for the camera-to-world pose `P = E⁻¹`: a perturbation in the **predicted camera's frame**, invariant to the choice of world frame. `frame="world"` rotates it into world coordinates for drawing.
+- The network learns the covariance in κ-weighted coordinates (κ = 10 on the rotational components). `pose_covariances_from_predictions` undoes the weighting; the rotational block is then in radians².
+- Camera 0's pose is the reference frame and carries no uncertainty; its covariance is not meaningful and is excluded from training and calibration.
 
-## Detailed Usage
-
-<details>
-<summary>Click to expand</summary>
-
-You can also optionally choose which attributes (branches) to predict, as shown below. This achieves the same result as the example above. This example uses a batch size of 1 (processing a single scene), but it naturally works for multiple scenes.
-
-```python
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-from vggt.utils.geometry import unproject_depth_map_to_point_map
-
-with torch.no_grad():
-    with torch.cuda.amp.autocast(dtype=dtype):
-        images = images[None]  # add batch dimension
-        aggregated_tokens_list, ps_idx = model.aggregator(images)
-                
-    # Predict Cameras
-    pose_enc = model.camera_head(aggregated_tokens_list)[-1]
-    # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
-    extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
-
-    # Predict Depth Maps
-    depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
-
-    # Predict Point Maps
-    point_map, point_conf = model.point_head(aggregated_tokens_list, images, ps_idx)
-        
-    # Construct 3D Points from Depth Maps and Cameras
-    # which usually leads to more accurate 3D points than point map branch
-    point_map_by_unprojection = unproject_depth_map_to_point_map(depth_map.squeeze(0), 
-                                                                extrinsic.squeeze(0), 
-                                                                intrinsic.squeeze(0))
-
-    # Predict Tracks
-    # choose your own points to track, with shape (N, 2) for one scene
-    query_points = torch.FloatTensor([[100.0, 200.0], 
-                                        [60.72, 259.94]]).to(device)
-    track_list, vis_score, conf_score = model.track_head(aggregated_tokens_list, images, ps_idx, query_points=query_points[None])
-```
-
-
-Furthermore, if certain pixels in the input frames are unwanted (e.g., reflective surfaces, sky, or water), you can simply mask them by setting the corresponding pixel values to 0 or 1. Precise segmentation masks aren't necessary - simple bounding box masks work effectively (check this [issue](https://github.com/facebookresearch/vggt/issues/47) for an example).
-
-</details>
-
-
-## Interactive Demo
-
-We provide multiple ways to visualize your 3D reconstructions. Before using these visualization tools, install the required dependencies:
+## Demos
 
 ```bash
-pip install -r requirements_demo.txt
+export VGGT_UNCERTAINTY_CKPT=vggt_uncertainty_head_v1.pt
+python demo_viser.py --image_folder examples/kitchen/images        # interactive viewer: ellipsoids + cones
+python demo_viser.py --image_folder examples/kitchen/images --propagate_point_uncertainty   # per-point ellipsoids (slow)
+python demo_gradio.py                                              # web UI with uncertainty plots
 ```
 
-### Interactive 3D Visualization
+Ellipsoids and cones are drawn at their true 95% size; the *sigma multiplier* slider only rescales the drawing. `demo_colmap.py` is unchanged from upstream.
 
-**Please note:** VGGT typically reconstructs a scene in less than 1 second. However, visualizing 3D points may take tens of seconds due to third-party rendering, independent of VGGT's processing time. The visualization is slow especially when the number of images is large.
+## Training and evaluation
 
-
-#### Gradio Web Interface
-
-Our Gradio-based interface allows you to upload images/videos, run reconstruction, and interactively explore the 3D scene in your browser. You can launch this in your local machine or try it on [Hugging Face](https://huggingface.co/spaces/facebook/vggt).
-
+Fine-tuning the covariance branch on CO3D takes about 11 hours on one 24 GB GPU (20 epochs of 500 steps, validation included). See [training/README.md](training/README.md) for data preparation, the curriculum, and how to evaluate, calibrate and export the head:
 
 ```bash
-python demo_gradio.py
+export CO3D_DIR=/path/to/CO3D CO3D_ANNOTATION_DIR=/path/to/CO3D_ann VGGT_PRETRAINED_CKPT=/path/to/model.pt
+cd training && torchrun --nproc_per_node=1 launch.py --config default
 ```
 
-<details>
-<summary>Click to preview the Gradio interactive interface</summary>
+## Reproducing the thesis figures and tables
 
-![Gradio Web Interface Preview](https://jytime.github.io/data/vggt_hf_demo_screen.png)
-</details>
+See [reproduce/README.md](reproduce/README.md): the commands, data splits, frame lists and COLMAP models behind every table and figure of the revised thesis. `reproduce/scene_figures.sh` regenerates the scene figures and the comparison with COLMAP bundle adjustment.
 
+## Limitations
 
-#### Viser 3D Viewer
+- Trained on 18 CO3D categories (object-centric videos, 2–24 frames per sample) with COLMAP pseudo-ground-truth; the learned uncertainty is relative to COLMAP's solution and may not transfer to very different scenes.
+- Unimodal Gaussian on se(3): symmetric or multi-modal ambiguities are not represented, and the pose errors are heavier-tailed than a Gaussian (about 9% of held-out frames fall outside the 99% region).
+- The covariance is in VGGT's normalized units; absolute metric scale is not recovered.
 
-Run the following command to run reconstruction and visualize the point clouds in viser. Note this script requires a path to a folder containing images. It assumes only image files under the folder. You can set `--use_point_map` to use the point cloud from the point map branch, instead of the depth-based point cloud.
+## Citation
 
-```bash
-python demo_viser.py --image_folder path/to/your/images/folder
+```bibtex
+@thesis{vanni2026vggt_uncertainty,
+  title  = {Geometrically-Grounded Uncertainty Quantification for Foundational 3D Vision Models},
+  author = {Vanni, Leonardo},
+  school = {Bocconi University},
+  type   = {Bachelor's thesis},
+  year   = {2026}
+}
+
+@inproceedings{wang2025vggt,
+  title     = {VGGT: Visual Geometry Grounded Transformer},
+  author    = {Wang, Jianyuan and Chen, Minghao and Karaev, Nikita and Vedaldi, Andrea and Rupprecht, Christian and Novotny, David},
+  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  year      = {2025}
+}
 ```
 
-## Exporting to COLMAP Format
+## License and acknowledgements
 
-We also support exporting VGGT's predictions directly to COLMAP format, by:
-
-```bash 
-# Feedforward prediction only
-python demo_colmap.py --scene_dir=/YOUR/SCENE_DIR/ 
-
-# With bundle adjustment
-python demo_colmap.py --scene_dir=/YOUR/SCENE_DIR/ --use_ba
-
-# Run with bundle adjustment using reduced parameters for faster processing
-# Reduces max_query_pts from 4096 (default) to 2048 and query_frame_num from 8 (default) to 5
-# Trade-off: Faster execution but potentially less robust reconstruction in complex scenes (you may consider setting query_frame_num equal to your total number of images) 
-# See demo_colmap.py for additional bundle adjustment configuration options
-python demo_colmap.py --scene_dir=/YOUR/SCENE_DIR/ --use_ba --max_query_pts=2048 --query_frame_num=5
-```
-
-Please ensure that the images are stored in `/YOUR/SCENE_DIR/images/`. This folder should contain only the images. Check the examples folder for the desired data structure. 
-
-The reconstruction result (camera parameters and 3D points) will be automatically saved under `/YOUR/SCENE_DIR/sparse/` in the COLMAP format, such as:
-
-``` 
-SCENE_DIR/
-├── images/
-└── sparse/
-    ├── cameras.bin
-    ├── images.bin
-    └── points3D.bin
-```
-
-## Integration with Gaussian Splatting
-
-
-The exported COLMAP files can be directly used with [gsplat](https://github.com/nerfstudio-project/gsplat) for Gaussian Splatting training. Install `gsplat` following their official instructions (we recommend `gsplat==1.3.0`):
-
-An example command to train the model is:
-```
-cd gsplat
-python examples/simple_trainer.py  default --data_factor 1 --data_dir /YOUR/SCENE_DIR/ --result_dir /YOUR/RESULT_DIR/
-```
-
-
-
-## Zero-shot Single-view Reconstruction
-
-Our model shows surprisingly good performance on single-view reconstruction, although it was never trained for this task. The model does not need to duplicate the single-view image to a pair, instead, it can directly infer the 3D structure from the tokens of the single view image. Feel free to try it with our demos above, which naturally works for single-view reconstruction.
-
-
-We did not quantitatively test monocular depth estimation performance ourselves, but [@kabouzeid](https://github.com/kabouzeid) generously provided a comparison of VGGT to recent methods [here](https://github.com/facebookresearch/vggt/issues/36). VGGT shows competitive or better results compared to state-of-the-art monocular approaches such as DepthAnything v2 or MoGe, despite never being explicitly trained for single-view tasks. 
-
-
-
-## Runtime and GPU Memory
-
-We benchmark the runtime and GPU memory usage of VGGT's aggregator on a single NVIDIA H100 GPU across various input sizes. 
-
-| **Input Frames** | 1 | 2 | 4 | 8 | 10 | 20 | 50 | 100 | 200 |
-|:----------------:|:-:|:-:|:-:|:-:|:--:|:--:|:--:|:---:|:---:|
-| **Time (s)**     | 0.04 | 0.05 | 0.07 | 0.11 | 0.14 | 0.31 | 1.04 | 3.12 | 8.75 |
-| **Memory (GB)**  | 1.88 | 2.07 | 2.45 | 3.23 | 3.63 | 5.58 | 11.41 | 21.15 | 40.63 |
-
-Note that these results were obtained using Flash Attention 3, which is faster than the default Flash Attention 2 implementation while maintaining almost the same memory usage. Feel free to compile Flash Attention 3 from source to get better performance.
-
-
-## Research Progression
-
-Our work builds upon a series of previous research projects. If you're interested in understanding how our research evolved, check out our previous works:
-
-
-<table border="0" cellspacing="0" cellpadding="0">
-  <tr>
-    <td align="left">
-      <a href="https://github.com/jytime/Deep-SfM-Revisited">Deep SfM Revisited</a>
-    </td>
-    <td style="white-space: pre;">──┐</td>
-    <td></td>
-  </tr>
-  <tr>
-    <td align="left">
-      <a href="https://github.com/facebookresearch/PoseDiffusion">PoseDiffusion</a>
-    </td>
-    <td style="white-space: pre;">─────►</td>
-    <td>
-      <a href="https://github.com/facebookresearch/vggsfm">VGGSfM</a> ──►
-      <a href="https://github.com/facebookresearch/vggt">VGGT</a>
-    </td>
-  </tr>
-  <tr>
-    <td align="left">
-      <a href="https://github.com/facebookresearch/co-tracker">CoTracker</a>
-    </td>
-    <td style="white-space: pre;">──┘</td>
-    <td></td>
-  </tr>
-</table>
-
-
-## Acknowledgements
-
-Thanks to these great repositories: [PoseDiffusion](https://github.com/facebookresearch/PoseDiffusion), [VGGSfM](https://github.com/facebookresearch/vggsfm), [CoTracker](https://github.com/facebookresearch/co-tracker), [DINOv2](https://github.com/facebookresearch/dinov2), [Dust3r](https://github.com/naver/dust3r), [Moge](https://github.com/microsoft/moge), [PyTorch3D](https://github.com/facebookresearch/pytorch3d), [Sky Segmentation](https://github.com/xiongzhu666/Sky-Segmentation-and-Post-processing), [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2), [Metric3D](https://github.com/YvanYin/Metric3D) and many other inspiring works in the community.
-
-## Checklist
-
-- [x] Release the training code
-- [ ] Release VGGT-500M and VGGT-200M
-
-
-## License
-See the [LICENSE](./LICENSE.txt) file for details about the license under which this code is made available.
+This is a derivative work of [facebookresearch/vggt](https://github.com/facebookresearch/vggt) and is distributed under the same [CC BY-NC 4.0](./LICENSE.txt) license; see [NOTICE.md](NOTICE.md). The upstream README, demos and training framework are by the VGGT authors; the uncertainty extension is by Leonardo Vanni (supervisor: Prof. Alessandro Pigati). Thanks also to the CO3D, DINOv2 and COLMAP projects.

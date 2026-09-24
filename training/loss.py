@@ -3,81 +3,270 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+#
+# The pose-uncertainty (NLL + regularizers) part of this file was added by Leonardo Vanni
+# (2025-2026) and is distributed under the same license.
+
+import math
+from math import ceil, floor
+from typing import Dict, Mapping, Optional
 
 import torch
 import torch.nn.functional as F
-
-from dataclasses import dataclass
-from vggt.utils.pose_enc import extri_intri_to_pose_encoding
 from train_utils.general import check_and_fix_inf_nan
-from math import ceil, floor
+
+from vggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_extri_intri
+from vggt.utils.uncertainty import (
+    cholesky_vector_to_L,
+    covariance_from_L,
+    gaussian_nll,
+    pose_error_twist,
+    twist_weights,
+)
 
 
-@dataclass(eq=False)
+# ======================================================================================
+# Pose-uncertainty loss (thesis §3.4-3.6)
+# ======================================================================================
+def uncertainty_scale_loss(sigma_trans: torch.Tensor, target_sigma: float, mask: torch.Tensor) -> torch.Tensor:
+    """Algorithm 3: one-sided penalty on translational std-devs exceeding ``target_sigma``.
+
+    Poses are expressed in the normalized frame (mean point distance from camera 0 = 1),
+    so the scene scale is 1 by construction and the target is ``r * 1``.
+
+    Args:
+        sigma_trans: (B, S, 3) translational standard deviations (normalized scene units).
+        target_sigma: r in the thesis (0.05 of the unit scene scale).
+        mask: (B, S) boolean mask of frames that take part in the loss.
+    """
+    excess = torch.relu(sigma_trans - target_sigma)
+    per_frame = (torch.exp(excess) - 1.0).mean(dim=-1)  # (B, S)
+    return masked_mean(per_frame, mask)
+
+
+def condition_number_loss(Sigma: torch.Tensor, tolerance: float, mask: torch.Tensor, min_eig: float = 1e-10) -> torch.Tensor:
+    """One-sided penalty on ``log(lambda_max / lambda_min) - log(tolerance)`` (thesis Algorithm 4)."""
+    eig = torch.linalg.eigvalsh(Sigma).clamp(min=min_eig)  # ascending
+    log_cond = torch.log(eig[..., -1]) - torch.log(eig[..., 0])
+    per_frame = torch.relu(log_cond - math.log(tolerance))
+    return masked_mean(per_frame, mask)
+
+
+def uncertainty_balance_loss(sigma_trans: torch.Tensor, log_ratio_threshold: float, mask: torch.Tensor) -> torch.Tensor:
+    """Algorithm 5: penalise anisotropy between the translational axes.
+
+    ``L_std = mean(l_k^2)`` plus ``sum_k (exp(max(|l_k| - tau, 0)) - 1)`` over the three
+    pairwise log-ratios ``l_k`` of the translational standard deviations.
+    """
+    log_sigma = torch.log(sigma_trans.clamp(min=1e-12))
+    log_ratios = torch.stack(
+        [
+            log_sigma[..., 0] - log_sigma[..., 1],
+            log_sigma[..., 0] - log_sigma[..., 2],
+            log_sigma[..., 1] - log_sigma[..., 2],
+        ],
+        dim=-1,
+    )  # (B, S, 3)
+    l_std = (log_ratios * log_ratios).mean(dim=-1)
+    l_exp = (torch.exp(torch.relu(log_ratios.abs() - log_ratio_threshold)) - 1.0).sum(dim=-1)
+    return masked_mean(l_std + l_exp, mask)
+
+
+def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    # torch.where rather than x * mask, so an inf in a masked-out entry cannot turn into NaN
+    return torch.where(mask, x, torch.zeros_like(x)).sum() / mask.sum().clamp(min=1).to(x.dtype)
+
+
+# The whole loss runs in fp32 with autocast off.  Under bf16 autocast the matmuls in the
+# SE(3) log map lose ~3 digits, and near a 180-degree rotation error (sin(theta) ~ 0) that
+# noise is amplified into twists of 1e10.  .float() alone does not help: autocast recasts.
+@torch.autocast(device_type="cuda", enabled=False)
+def compute_pose_nll_loss(
+    predictions: Mapping,
+    batch: Mapping,
+    *,
+    kappa: float = 10.0,
+    error_convention: str = "body",
+    shield_eps: float = 1e-4,
+    log_diag_min: Optional[float] = -7.0,
+    log_diag_max: Optional[float] = 3.0,
+    exclude_reference_frame: bool = True,
+    temperature: float = 1.0,
+    nll_weight: float = 1.0,
+    regularizer_weight_factor: float = 1.0,
+    scale_regularization: float = 1.0,
+    condition_number_regularization: float = 1.0,
+    balance_regularization: float = 1.0,
+    uncertainty_scale_target: float = 0.05,
+    condition_number_tolerance: float = 20.0,
+    balance_log_ratio_threshold: float = math.log(5.0),
+) -> Dict[str, torch.Tensor]:
+    """Scale-aware Gaussian NLL of the pose error on se(3) plus the three regularizers.
+
+    ``batch["extrinsics"]`` must already be the *normalized* ground truth produced by
+    ``Trainer._process_batch`` (world frame = first camera, mean point distance 1), so
+    all quantities below are in normalized scene units.  The error twist is
+    ``log(E_pred inv(E_gt))`` (body-centric), weighted by
+    ``W = diag(1,1,1,kappa,kappa,kappa)``; the network's covariance lives in these
+    weighted coordinates.
+
+    ``nll_weight`` (0 during the warm-up phase) and ``regularizer_weight_factor``
+    (linear annealing) implement the curriculum of thesis §3.7.1 and are set by
+    :class:`MultitaskLoss`.  ``temperature`` multiplies the covariance and is meant for
+    evaluation only.
+    """
+    pose_enc = predictions["pose_enc"].float()  # (B, S, 9)
+    cholesky_vector = predictions["cholesky_vector"].float()  # (B, S, 21)
+    E_gt = batch["extrinsics"].float()  # (B, S, 3, 4), normalized
+    image_hw = batch["images"].shape[-2:]
+    B, S = pose_enc.shape[:2]
+    device = pose_enc.device
+
+    E_pred, _ = pose_encoding_to_extri_intri(pose_enc, image_hw)
+    xi = pose_error_twist(E_pred, E_gt, convention=error_convention)  # (B, S, 6)
+    xi = check_and_fix_inf_nan(xi, "pose_error_twist")
+    xi_w = xi * twist_weights(kappa, device=device, dtype=xi.dtype)
+
+    L, log_diag = cholesky_vector_to_L(cholesky_vector, log_diag_min, log_diag_max)
+    if temperature != 1.0:
+        # T (L L^T + eps I) = (sqrt(T) L)(sqrt(T) L)^T + (T eps) I: the temperature scales the
+        # shielded covariance, exactly as at inference (pose_covariances_from_predictions).
+        L = L * math.sqrt(temperature)
+        log_diag = log_diag + 0.5 * math.log(temperature)
+        shield_eps = shield_eps * temperature
+    nll, mahalanobis_sq, log_det = gaussian_nll(xi_w, L, shield_eps)  # (B, S)
+
+    mask = torch.ones(B, S, dtype=torch.bool, device=device)
+    if exclude_reference_frame:
+        mask[:, 0] = False  # camera 0 is the identity for both prediction and GT
+    if "scene_scale_valid" in batch:  # no valid depth point -> scene scale undefined, GT unusable
+        mask &= batch["scene_scale_valid"].to(device).view(B, 1)
+    mean_nll = masked_mean(nll, mask)
+
+    sigma = torch.exp(log_diag)  # (B, S, 6) std-devs in weighted coordinates
+    Sigma = covariance_from_L(L, shield_eps)
+    f = regularizer_weight_factor
+    scale_loss = f * scale_regularization * uncertainty_scale_loss(sigma[..., :3], uncertainty_scale_target, mask)
+    cond_loss = f * condition_number_regularization * condition_number_loss(Sigma, condition_number_tolerance, mask)
+    balance_loss = f * balance_regularization * uncertainty_balance_loss(sigma[..., :3], balance_log_ratio_threshold, mask)
+
+    total = nll_weight * mean_nll + scale_loss + cond_loss + balance_loss
+    total = check_and_fix_inf_nan(total, "pose_nll_total", hard_max=None)
+
+    out_dtype = predictions["pose_enc"].dtype
+    return {
+        "loss_nll": total.to(out_dtype),
+        "loss_nll_base": mean_nll.detach().to(out_dtype),
+        "loss_uncertainty_scale": scale_loss.detach().to(out_dtype),
+        "loss_uncertainty_balance": balance_loss.detach().to(out_dtype),
+        "loss_condition_number": cond_loss.detach().to(out_dtype),
+        "mahalanobis_mean": masked_mean(mahalanobis_sq, mask).detach().to(out_dtype),
+        "log_det_mean": masked_mean(log_det, mask).detach().to(out_dtype),
+        "sigma_trans_mean": masked_mean(sigma[..., :3].mean(-1), mask).detach().to(out_dtype),
+        "sigma_rot_mean_deg": masked_mean(sigma[..., 3:].mean(-1), mask).detach().to(out_dtype) * (180.0 / math.pi / kappa),
+        "twist_trans_err_mean": masked_mean(xi[..., :3].norm(dim=-1), mask).detach().to(out_dtype),
+        "twist_rot_err_mean_deg": masked_mean(xi[..., 3:].norm(dim=-1), mask).detach().to(out_dtype) * (180.0 / math.pi),
+        # per-frame values of the frames that entered the loss (camera-0 frames excluded),
+        # saved by the validation loop for calibration analysis (plot_calibration.py)
+        "raw_mahalanobis_sq": mahalanobis_sq.detach()[mask].cpu(),
+        "raw_log_det": log_det.detach()[mask].cpu(),
+        "raw_trans_err": xi[..., :3].norm(dim=-1).detach()[mask].cpu(),
+        "raw_rot_err_deg": (xi[..., 3:].norm(dim=-1).detach()[mask] * (180.0 / math.pi)).cpu(),
+    }
+
+
 class MultitaskLoss(torch.nn.Module):
+    """Combines the pose-uncertainty NLL with the upstream VGGT depth/point losses.
+
+    Curriculum (thesis §3.7.1): for ``epoch < warmup_epochs`` the NLL is disabled and only
+    the regularizers train the covariance branch; afterwards the NLL is enabled and the
+    regularizer weights decay linearly to zero at ``total_epochs`` when
+    ``anneal_regularizers`` is set.  ``eval_temperature`` is applied only in the ``val``
+    phase (post-hoc temperature scaling) and never during training.
     """
-    Multi-task loss module that combines different loss types for VGGT.
-    
-    Supports:
-    - Camera loss
-    - Depth loss 
-    - Point loss
-    - Tracking loss (not cleaned yet, dirty code is at the bottom of this file)
-    """
-    def __init__(self, camera=None, depth=None, point=None, track=None, **kwargs):
+
+    def __init__(
+        self,
+        camera=None,
+        depth=None,
+        point=None,
+        track=None,
+        pose_uncertainty: Optional[Dict] = None,
+        warmup_epochs: int = 1,
+        anneal_regularizers: bool = True,
+        eval_temperature: float = 1.0,
+        **kwargs,
+    ):
         super().__init__()
-        # Loss configuration dictionaries for each task
         self.camera = camera
         self.depth = depth
         self.point = point
         self.track = track
+        self.pose_uncertainty = dict(pose_uncertainty) if pose_uncertainty is not None else {}
+        self.warmup_epochs = int(warmup_epochs)
+        self.anneal_regularizers = bool(anneal_regularizers)
+        self.eval_temperature = float(eval_temperature)
+        if kwargs:
+            raise TypeError(f"MultitaskLoss got unexpected config keys: {sorted(kwargs)}")
 
-    def forward(self, predictions, batch) -> torch.Tensor:
-        """
-        Compute the total multi-task loss.
-        
-        Args:
-            predictions: Dict containing model predictions for different tasks
-            batch: Dict containing ground truth data and masks
-            
-        Returns:
-            Dict containing individual losses and total objective
-        """
-        total_loss = 0
+    def curriculum(self, epoch: int, total_epochs: int, phase: str):
+        """Return ``(nll_weight, regularizer_weight_factor, temperature)`` for this step."""
+        if phase != "train":
+            return 1.0, 1.0, self.eval_temperature
+        if epoch < self.warmup_epochs:
+            return 0.0, 1.0, 1.0
+        if not self.anneal_regularizers:
+            return 1.0, 1.0, 1.0
+        span = max(total_epochs - self.warmup_epochs, 1)
+        factor = max(0.0, 1.0 - (epoch - self.warmup_epochs) / span)
+        return 1.0, factor, 1.0
+
+    def forward(self, predictions, batch, epoch: int = 0, total_epochs: int = 1, phase: str = "train") -> dict:
+        device = next(iter(predictions.values())).device
+        total_loss = torch.zeros((), device=device)
         loss_dict = {}
-        
-        # Camera pose loss - if pose encodings are predicted
-        if "pose_enc_list" in predictions:
-            camera_loss_dict = compute_camera_loss(predictions, batch, **self.camera)   
-            camera_loss = camera_loss_dict["loss_camera"] * self.camera["weight"]   
-            total_loss = total_loss + camera_loss
+
+        if "cholesky_vector" in predictions:
+            nll_weight, factor, temperature = self.curriculum(epoch, total_epochs, phase)
+            pose_dict = compute_pose_nll_loss(
+                predictions,
+                batch,
+                nll_weight=nll_weight,
+                regularizer_weight_factor=factor,
+                temperature=temperature,
+                **self.pose_uncertainty,
+            )
+            total_loss = total_loss + pose_dict["loss_nll"]
+            loss_dict.update(pose_dict)
+            loss_dict["curriculum_nll_weight"] = torch.tensor(nll_weight, device=device)
+            loss_dict["curriculum_regularizer_factor"] = torch.tensor(factor, device=device)
+        elif "pose_enc_list" in predictions and self.camera is not None:
+            camera_loss_dict = compute_camera_loss(predictions, batch, **self.camera)
+            total_loss = total_loss + camera_loss_dict["loss_camera"] * self.camera.get("weight", 1.0)
             loss_dict.update(camera_loss_dict)
-        
-        # Depth estimation loss - if depth maps are predicted
-        if "depth" in predictions:
+
+        if "depth" in predictions and self.depth is not None:
             depth_loss_dict = compute_depth_loss(predictions, batch, **self.depth)
             depth_loss = depth_loss_dict["loss_conf_depth"] + depth_loss_dict["loss_reg_depth"] + depth_loss_dict["loss_grad_depth"]
-            depth_loss = depth_loss * self.depth["weight"]
-            total_loss = total_loss + depth_loss
+            total_loss = total_loss + depth_loss * self.depth["weight"]
             loss_dict.update(depth_loss_dict)
 
-        # 3D point reconstruction loss - if world points are predicted
-        if "world_points" in predictions:
+        if "world_points" in predictions and self.point is not None:
             point_loss_dict = compute_point_loss(predictions, batch, **self.point)
             point_loss = point_loss_dict["loss_conf_point"] + point_loss_dict["loss_reg_point"] + point_loss_dict["loss_grad_point"]
-            point_loss = point_loss * self.point["weight"]
-            total_loss = total_loss + point_loss
+            total_loss = total_loss + point_loss * self.point["weight"]
             loss_dict.update(point_loss_dict)
 
-        # Tracking loss - not cleaned yet, dirty code is at the bottom of this file
         if "track" in predictions:
             raise NotImplementedError("Track loss is not cleaned up yet")
-        
-        loss_dict["objective"] = total_loss
 
+        loss_dict["objective"] = check_and_fix_inf_nan(total_loss, "total_objective_loss", hard_max=None)
         return loss_dict
 
 
+# ======================================================================================
+# Upstream VGGT losses (unchanged)
+# ======================================================================================
 def compute_camera_loss(
     pred_dict,              # predictions dict, contains pose encodings
     batch_data,             # ground truth and mask batch dict
@@ -157,7 +346,7 @@ def compute_camera_loss(
 def camera_loss_single(pred_pose_enc, gt_pose_enc, loss_type="l1"):
     """
     Computes translation, rotation, and focal loss for a batch of pose encodings.
-    
+
     Args:
         pred_pose_enc: (N, D) predicted pose encoding
         gt_pose_enc: (N, D) ground truth pose encoding
@@ -166,7 +355,7 @@ def camera_loss_single(pred_pose_enc, gt_pose_enc, loss_type="l1"):
         loss_T: translation loss (mean)
         loss_R: rotation loss (mean)
         loss_FL: focal length/intrinsics loss (mean)
-    
+
     NOTE: The paper uses smooth l1 loss, but we found l1 loss is more stable than smooth l1 and l2 loss.
         So here we use l1 loss.
     """
@@ -199,7 +388,7 @@ def camera_loss_single(pred_pose_enc, gt_pose_enc, loss_type="l1"):
 def compute_point_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_fn = None, valid_range=-1, **kwargs):
     """
     Compute point loss.
-    
+
     Args:
         predictions: Dict containing 'world_points' and 'world_points_conf'
         batch: Dict containing ground truth 'world_points' and 'point_masks'
@@ -212,34 +401,34 @@ def compute_point_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
     pred_points_conf = predictions['world_points_conf']
     gt_points = batch['world_points']
     gt_points_mask = batch['point_masks']
-    
+
     gt_points = check_and_fix_inf_nan(gt_points, "gt_points")
-    
+
     if gt_points_mask.sum() < 100:
         # If there are less than 100 valid points, skip this batch
         dummy_loss = (0.0 * pred_points).mean()
-        loss_dict = {f"loss_conf_point": dummy_loss,
-                    f"loss_reg_point": dummy_loss,
-                    f"loss_grad_point": dummy_loss,}
+        loss_dict = {"loss_conf_point": dummy_loss,
+                    "loss_reg_point": dummy_loss,
+                    "loss_grad_point": dummy_loss,}
         return loss_dict
-    
+
     # Compute confidence-weighted regression loss with optional gradient loss
     loss_conf, loss_grad, loss_reg = regression_loss(pred_points, gt_points, gt_points_mask, conf=pred_points_conf,
                                              gradient_loss_fn=gradient_loss_fn, gamma=gamma, alpha=alpha, valid_range=valid_range)
-    
+
     loss_dict = {
-        f"loss_conf_point": loss_conf,
-        f"loss_reg_point": loss_reg,
-        f"loss_grad_point": loss_grad,
+        "loss_conf_point": loss_conf,
+        "loss_reg_point": loss_reg,
+        "loss_grad_point": loss_grad,
     }
-    
+
     return loss_dict
 
 
 def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_fn = None, valid_range=-1, **kwargs):
     """
     Compute depth loss.
-    
+
     Args:
         predictions: Dict containing 'depth' and 'depth_conf'
         batch: Dict containing ground truth 'depths' and 'point_masks'
@@ -259,9 +448,9 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
     if gt_depth_mask.sum() < 100:
         # If there are less than 100 valid points, skip this batch
         dummy_loss = (0.0 * pred_depth).mean()
-        loss_dict = {f"loss_conf_depth": dummy_loss,
-                    f"loss_reg_depth": dummy_loss,
-                    f"loss_grad_depth": dummy_loss,}
+        loss_dict = {"loss_conf_depth": dummy_loss,
+                    "loss_reg_depth": dummy_loss,
+                    "loss_grad_depth": dummy_loss,}
         return loss_dict
 
     # NOTE: we put conf inside regression_loss so that we can also apply conf loss to the gradient loss in a multi-scale manner
@@ -270,9 +459,9 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
                                              gradient_loss_fn=gradient_loss_fn, gamma=gamma, alpha=alpha, valid_range=valid_range)
 
     loss_dict = {
-        f"loss_conf_depth": loss_conf,
-        f"loss_reg_depth": loss_reg,    
-        f"loss_grad_depth": loss_grad,
+        "loss_conf_depth": loss_conf,
+        "loss_reg_depth": loss_reg,
+        "loss_grad_depth": loss_grad,
     }
 
     return loss_dict
@@ -281,11 +470,11 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
 def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0, alpha=0.2, valid_range=-1):
     """
     Core regression loss function with confidence weighting and optional gradient loss.
-    
+
     Computes:
     1. gamma * ||pred - gt||^2 * conf - alpha * log(conf)
     2. Optional gradient loss
-    
+
     Args:
         pred: (B, S, H, W, C) predicted values
         gt: (B, S, H, W, C) ground truth values
@@ -295,7 +484,7 @@ def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0,
         gamma: Weight for confidence loss
         alpha: Weight for confidence regularization
         valid_range: Quantile range for outlier filtering
-    
+
     Returns:
         loss_conf: Confidence-weighted loss
         loss_grad: Gradient loss (0 if not specified)
@@ -311,7 +500,7 @@ def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0,
     # This encourages the model to be confident on easy examples and less confident on hard ones
     loss_conf = gamma * loss_reg * conf[mask] - alpha * torch.log(conf[mask])
     loss_conf = check_and_fix_inf_nan(loss_conf, "loss_conf")
-        
+
     # Initialize gradient loss
     loss_grad = 0
 
@@ -348,7 +537,7 @@ def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0,
         if valid_range>0:
             loss_conf = filter_by_quantile(loss_conf, valid_range)
 
-        loss_conf = check_and_fix_inf_nan(loss_conf, f"loss_conf_depth")
+        loss_conf = check_and_fix_inf_nan(loss_conf, "loss_conf_depth")
         loss_conf = loss_conf.mean()
     else:
         loss_conf = (0.0 * pred).mean()
@@ -359,7 +548,7 @@ def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0,
         if valid_range>0:
             loss_reg = filter_by_quantile(loss_reg, valid_range)
 
-        loss_reg = check_and_fix_inf_nan(loss_reg, f"loss_reg_depth")
+        loss_reg = check_and_fix_inf_nan(loss_reg, "loss_reg_depth")
         loss_reg = loss_reg.mean()
     else:
         loss_reg = (0.0 * pred).mean()
@@ -371,10 +560,10 @@ def gradient_loss_multi_scale_wrapper(prediction, target, mask, scales=4, gradie
     """
     Multi-scale gradient loss wrapper. Applies gradient loss at multiple scales by subsampling the input.
     This helps capture both fine and coarse spatial structures.
-    
+
     Args:
         prediction: (B, H, W, C) predicted values
-        target: (B, H, W, C) ground truth values  
+        target: (B, H, W, C) ground truth values
         mask: (B, H, W) valid pixel mask
         scales: Number of scales to use
         gradient_loss_fn: Gradient loss function to apply
@@ -398,10 +587,10 @@ def gradient_loss_multi_scale_wrapper(prediction, target, mask, scales=4, gradie
 def normal_loss(prediction, target, mask, cos_eps=1e-8, conf=None, gamma=1.0, alpha=0.2):
     """
     Surface normal-based loss for geometric consistency.
-    
+
     Computes surface normals from 3D point maps using cross products of neighboring points,
     then measures the angle between predicted and ground truth normals.
-    
+
     Args:
         prediction: (B, H, W, 3) predicted 3D coordinates/points
         target: (B, H, W, 3) ground-truth 3D coordinates/points
@@ -456,7 +645,7 @@ def normal_loss(prediction, target, mask, cos_eps=1e-8, conf=None, gamma=1.0, al
 def gradient_loss(prediction, target, mask, conf=None, gamma=1.0, alpha=0.2):
     """
     Gradient-based loss. Computes the L1 difference between adjacent pixels in x and y directions.
-    
+
     Args:
         prediction: (B, H, W, C) predicted values
         target: (B, H, W, C) ground truth values
@@ -511,15 +700,15 @@ def gradient_loss(prediction, target, mask, conf=None, gamma=1.0, alpha=0.2):
 def point_map_to_normal(point_map, mask, eps=1e-6):
     """
     Convert 3D point map to surface normal vectors using cross products.
-    
+
     Computes normals by taking cross products of neighboring point differences.
     Uses 4 different cross-product directions for robustness.
-    
+
     Args:
         point_map: (B, H, W, 3) 3D points laid out in a 2D grid
         mask: (B, H, W) valid pixels (bool)
         eps: Epsilon for numerical stability in normalization
-    
+
     Returns:
         normals: (4, B, H, W, 3) normal vectors for each of the 4 cross-product directions
         valids: (4, B, H, W) corresponding valid masks
@@ -567,15 +756,15 @@ def point_map_to_normal(point_map, mask, eps=1e-6):
 def filter_by_quantile(loss_tensor, valid_range, min_elements=1000, hard_max=100):
     """
     Filter loss tensor by keeping only values below a certain quantile threshold.
-    
+
     This helps remove outliers that could destabilize training.
-    
+
     Args:
         loss_tensor: Tensor containing loss values
         valid_range: Float between 0 and 1 indicating the quantile threshold
         min_elements: Minimum number of elements required to apply filtering
         hard_max: Maximum allowed value for any individual loss
-    
+
     Returns:
         Filtered and clamped loss tensor
     """

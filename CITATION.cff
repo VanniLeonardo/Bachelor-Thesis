@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "If you use this code or the released uncertainty head, please cite the thesis and the VGGT paper."
+title: "VGGT with Camera-Pose Uncertainty"
+type: software
+version: 1.0.0
+license: CC-BY-NC-4.0
+repository-code: "https://github.com/VanniLeonardo/Bachelor-Thesis"
+authors:
+  - family-names: Vanni
+    given-names: Leonardo
+    affiliation: Bocconi University
+preferred-citation:
+  type: thesis
+  title: "Geometrically-Grounded Uncertainty Quantification for Foundational 3D Vision Models"
+  authors:
+    - family-names: Vanni
+      given-names: Leonardo
+  institution:
+    name: Bocconi University
+  thesis-type: "Bachelor's thesis"
+  year: 2026
+references:
+  - type: conference-paper
+    title: "VGGT: Visual Geometry Grounded Transformer"
+    authors:
+      - family-names: Wang
+        given-names: Jianyuan
+      - family-names: Chen
+        given-names: Minghao
+      - family-names: Karaev
+        given-names: Nikita
+      - family-names: Vedaldi
+        given-names: Andrea
+      - family-names: Rupprecht
+        given-names: Christian
+      - family-names: Novotny
+        given-names: David
+    collection-title: "Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition"
+    year: 2025
